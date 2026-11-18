@@ -69,3 +69,55 @@ test('stripMp4MetadataInBrowser removes all AI signatures from sample MP4 buffer
   assert.equal(/Runway|Google Flow|Luma|Pika|c2pa/i.test(cleanedText), false);
 });
 
+test('stripMp4MetadataInBrowser parses real MP4 box tree, converts udta/uuid to free, and preserves mdat bytes', () => {
+  const makeBox = (type: string, payload: Uint8Array): Uint8Array => {
+    const size = 8 + payload.byteLength;
+    const out = new Uint8Array(size);
+    out[0] = (size >>> 24) & 0xff;
+    out[1] = (size >>> 16) & 0xff;
+    out[2] = (size >>> 8) & 0xff;
+    out[3] = size & 0xff;
+    for (let i = 0; i < 4; i++) out[4 + i] = type.charCodeAt(i);
+    out.set(payload, 8);
+    return out;
+  };
+
+  const enc = new TextEncoder();
+  const ftyp = makeBox('ftyp', enc.encode('isom0000isommp42'));
+  const mvhd = makeBox('mvhd', new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]));
+  const udta = makeBox('udta', enc.encode('Runway Gen-3 Alpha | Google Flow | Luma | Pika'));
+  const moovPayload = new Uint8Array(mvhd.byteLength + udta.byteLength);
+  moovPayload.set(mvhd, 0);
+  moovPayload.set(udta, mvhd.byteLength);
+  const moov = makeBox('moov', moovPayload);
+  const uuid = makeBox('uuid', enc.encode('c2pa.jumbf.manifest TrainedAlgorithmicMedia'));
+  const mdatPayload = enc.encode('RAW_VIDEO_FRAME_BYTES_Runway_SHOULD_NOT_BE_TOUCHED');
+  const mdat = makeBox('mdat', mdatPayload);
+
+  const mp4 = new Uint8Array(
+    ftyp.byteLength + moov.byteLength + uuid.byteLength + mdat.byteLength
+  );
+  let pos = 0;
+  for (const part of [ftyp, moov, uuid, mdat]) {
+    mp4.set(part, pos);
+    pos += part.byteLength;
+  }
+
+  const scrubbed = stripMp4MetadataInBrowser(mp4);
+  assert.equal(scrubbed.byteLength, mp4.byteLength);
+
+  const dec = new TextDecoder('latin1');
+  const beforeMdatText = dec.decode(
+    scrubbed.subarray(0, ftyp.byteLength + moov.byteLength + uuid.byteLength)
+  );
+  assert.equal(/Runway|Google Flow|Luma|Pika|c2pa/i.test(beforeMdatText), false);
+
+  // Verify mdat payload is 100% bit-exact untouched
+  const mdatSlice = scrubbed.subarray(
+    mp4.byteLength - mdatPayload.byteLength,
+    mp4.byteLength
+  );
+  assert.equal(dec.decode(mdatSlice), 'RAW_VIDEO_FRAME_BYTES_Runway_SHOULD_NOT_BE_TOUCHED');
+});
+
+

@@ -152,68 +152,133 @@ export default function App() {
     }
   };
 
+  const [cleanBlobObj, setCleanBlobObj] = useState<Blob | null>(null);
+
+  const handleTriggerDownload = async (url?: string, name?: string, blobToShare?: Blob | null) => {
+    const targetUrl = url || cleanDownloadUrl;
+    const targetName = name || cleanFileName || 'Abubakar Remove AI.mp4';
+    const activeBlob = blobToShare !== undefined ? blobToShare : cleanBlobObj;
+
+    if (!targetUrl) return;
+
+    // On iOS Safari / Mobile, trigger programmatic anchor download
+    const a = document.createElement('a');
+    a.href = targetUrl;
+    a.download = targetName;
+    a.style.display = 'none';
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => {
+      document.body.removeChild(a);
+    }, 200);
+
+    // If running on mobile with Web Share API file support, also keep toast helpful
+    if (activeBlob) {
+      triggerToast(
+        'success',
+        'Downloading Clean Video',
+        `Saving "${targetName}" to your device.`
+      );
+    }
+  };
+
+  const handleNativeMobileShare = async () => {
+    if (!cleanBlobObj) return;
+    const outName = cleanFileName || 'Abubakar Remove AI.mp4';
+    try {
+      const shareFile = new File([cleanBlobObj], outName, { type: 'video/mp4' });
+      if (navigator.canShare && navigator.canShare({ files: [shareFile] })) {
+        await navigator.share({
+          files: [shareFile],
+          title: outName,
+        });
+        return;
+      }
+    } catch {
+      // User cancelled share sheet or unsupported
+    }
+    handleTriggerDownload();
+  };
+
   const handleProcessVideo = async () => {
     if (!selectedFile || isProcessing) return;
 
     setIsProcessing(true);
-    setProgress(15);
+    setProgress(20);
     setStepIndex(0);
     const startTime = performance.now();
 
     const progressTimer = setInterval(() => {
       setProgress((prev) => {
-        const next = prev < 90 ? prev + 15 : prev;
+        const next = prev < 90 ? prev + 18 : prev;
         if (next >= 75) setStepIndex(3);
         else if (next >= 50) setStepIndex(2);
         else if (next >= 25) setStepIndex(1);
         return next;
       });
-    }, 140);
+    }, 110);
 
     try {
       let cleanBlob: Blob;
       let cleanBuffer: Uint8Array;
       let serverDuration = 0;
-      let outName = cleanFileName || 'Abubakar Remove AI.mp4';
+      const outName = 'Abubakar Remove AI.mp4';
 
-      try {
-        const formData = new FormData();
-        formData.append('video', selectedFile);
+      const isFullStackHost =
+        typeof window !== 'undefined' &&
+        (window.location.hostname === 'localhost' ||
+          window.location.hostname.endsWith('.run.app'));
 
-        const response = await fetch('/api/strip-metadata', {
-          method: 'POST',
-          body: formData,
-        });
+      if (isFullStackHost && selectedFile.size <= 35 * 1024 * 1024) {
+        try {
+          const formData = new FormData();
+          formData.append('video', selectedFile);
 
-        const contentType = response.headers.get('Content-Type') || '';
-        if (!response.ok || !contentType.includes('video/mp4')) {
-          throw new Error('Static host fallback');
+          const response = await fetch('/api/strip-metadata', {
+            method: 'POST',
+            body: formData,
+          });
+
+          const contentType = response.headers.get('Content-Type') || '';
+          if (!response.ok || !contentType.includes('video/mp4')) {
+            throw new Error('Fallback to in-browser scrubber');
+          }
+
+          cleanBlob = await response.blob();
+          cleanBuffer = new Uint8Array(await cleanBlob.arrayBuffer());
+          serverDuration = Number(
+            response.headers.get('X-Process-Duration-Ms') ||
+              Math.max(12, Math.round(performance.now() - startTime))
+          );
+        } catch {
+          const rawBytes = new Uint8Array(await selectedFile.arrayBuffer());
+          cleanBuffer = stripMp4MetadataInBrowser(rawBytes);
+          cleanBlob = new Blob([cleanBuffer as unknown as BlobPart], {
+            type: 'video/mp4',
+          });
+          serverDuration = Math.max(10, Math.round(performance.now() - startTime));
         }
-
-        cleanBlob = await response.blob();
-        cleanBuffer = new Uint8Array(await cleanBlob.arrayBuffer());
-        serverDuration = Number(
-          response.headers.get('X-Process-Duration-Ms') ||
-            Math.max(12, Math.round(performance.now() - startTime))
-        );
-        outName =
-          response.headers.get('X-Clean-Filename') ||
-          'Abubakar Remove AI.mp4';
-      } catch {
-        // 100% Client-Side Lossless Binary Scrubber for InfinityFree / Static Hosting
+      } else {
+        // Direct In-Browser Lossless ISO MP4/MOV Atom Scrubber (Vercel, InfinityFree, & large mobile videos)
+        await new Promise((r) => setTimeout(r, 260));
         const rawBytes = new Uint8Array(await selectedFile.arrayBuffer());
         cleanBuffer = stripMp4MetadataInBrowser(rawBytes);
-        cleanBlob = new Blob([cleanBuffer as unknown as BlobPart], { type: 'video/mp4' });
-        serverDuration = Math.max(8, Math.round(performance.now() - startTime));
-        outName = 'Abubakar Remove AI.mp4';
+        cleanBlob = new Blob([cleanBuffer as unknown as BlobPart], {
+          type: 'video/mp4',
+        });
+        serverDuration = Math.max(12, Math.round(performance.now() - startTime));
       }
 
+      if (cleanDownloadUrl) {
+        URL.revokeObjectURL(cleanDownloadUrl);
+      }
       const url = URL.createObjectURL(cleanBlob);
 
       clearInterval(progressTimer);
       setProgress(100);
       setStepIndex(3);
 
+      setCleanBlobObj(cleanBlob);
       setCleanDownloadUrl(url);
       setCleanFileName(outName);
       setCleanFileSize(cleanBuffer.byteLength);
@@ -240,14 +305,14 @@ export default function App() {
       triggerToast(
         'success',
         'AI Metadata Completely Removed',
-        `Stripped ${detectedTags.length} AI metadata signatures in ${serverDuration} ms without re-encoding.`
+        `Stripped ${detectedTags.length} AI metadata signatures in ${serverDuration} ms. Ready to download as "${outName}".`
       );
     } catch (error: unknown) {
       clearInterval(progressTimer);
       setProgress(0);
       triggerToast(
         'error',
-        'Processing Failed',
+        'Video Processing Error',
         error instanceof Error
           ? error.message
           : 'Could not strip metadata from this file.'
@@ -375,7 +440,7 @@ export default function App() {
                 ref={fileInputRef}
                 id="mp4-file-input"
                 type="file"
-                accept="video/mp4,video/quicktime,video/x-m4v,.mp4,.mov,.m4v"
+                accept="video/*,.mp4,.mov,.m4v"
                 aria-label="Upload MP4 video file"
                 className="hidden"
                 onChange={(e) => {
@@ -474,8 +539,8 @@ export default function App() {
 
               {/* Active Staged Video & Action Card */}
               {selectedFile && (
-                <div className="rounded-xl border border-slate-800 bg-[#0F1624] p-6 space-y-5 overflow-hidden">
-                  <div className="flex items-start justify-between gap-4">
+                <div className="rounded-xl border border-slate-800 bg-[#0F1624] p-5 sm:p-6 space-y-5 overflow-hidden">
+                  <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-3.5">
                     <div className="flex items-start gap-3.5 min-w-0 flex-1">
                       <div className="w-10 h-10 rounded-lg bg-slate-800 border border-slate-700 flex items-center justify-center text-emerald-400 shrink-0 mt-0.5">
                         <Film className="w-5 h-5" />
@@ -492,7 +557,7 @@ export default function App() {
                       </div>
                     </div>
 
-                    <div className="flex items-center gap-2 shrink-0">
+                    <div className="flex items-center gap-2 shrink-0 self-end sm:self-auto">
                       {cleanDownloadUrl && (
                         <button
                           type="button"
@@ -571,16 +636,36 @@ export default function App() {
                         </span>
                       </div>
 
-                      <a
-                        href={cleanDownloadUrl}
-                        download={cleanFileName}
-                        className="w-full py-3.5 px-5 rounded-lg bg-emerald-400 hover:bg-emerald-300 text-slate-950 font-semibold text-sm flex items-center justify-center gap-2 transition-colors overflow-hidden"
-                      >
-                        <Download className="w-4 h-4 shrink-0" />
-                        <span className="truncate">
-                          Download Clean Video ({cleanFileName})
-                        </span>
-                      </a>
+                      <div className="flex flex-col sm:flex-row items-stretch gap-2.5">
+                        <a
+                          href={cleanDownloadUrl}
+                          download={cleanFileName}
+                          onClick={() =>
+                            triggerToast(
+                              'success',
+                              'Downloading Clean Video',
+                              `Saving "${cleanFileName}" to your device.`
+                            )
+                          }
+                          className="flex-1 py-3.5 px-5 rounded-lg bg-emerald-400 hover:bg-emerald-300 text-slate-950 font-semibold text-sm flex items-center justify-center gap-2 transition-colors overflow-hidden"
+                        >
+                          <Download className="w-4 h-4 shrink-0" />
+                          <span className="truncate">
+                            Download Clean Video ({cleanFileName})
+                          </span>
+                        </a>
+
+                        {typeof navigator !== 'undefined' &&
+                          typeof navigator.share === 'function' && (
+                            <button
+                              type="button"
+                              onClick={handleNativeMobileShare}
+                              className="py-3.5 px-4 rounded-lg border border-emerald-500/40 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-300 font-semibold text-xs transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                            >
+                              Save to Phone / Share
+                            </button>
+                          )}
+                      </div>
                     </div>
                   )}
                 </div>

@@ -136,18 +136,18 @@ export function validateVideoFile(
   const hasValidExt =
     lower.endsWith('.mp4') ||
     lower.endsWith('.mov') ||
-    lower.endsWith('.m4v');
+    lower.endsWith('.m4v') ||
+    lower.endsWith('.3gp') ||
+    lower.endsWith('.webm');
   const hasValidMime =
     !mimeType ||
-    mimeType === 'video/mp4' ||
-    mimeType === 'video/quicktime' ||
-    mimeType === 'video/x-m4v' ||
+    mimeType.startsWith('video/') ||
     mimeType === 'application/octet-stream';
 
   if (!hasValidExt && !hasValidMime) {
     return {
       valid: false,
-      error: 'Unsupported format. Please upload an MP4, MOV, or M4V video file.',
+      error: 'Unsupported format. Please upload an MP4 or MOV video file.',
       normalizedCleanName: AUTO_VIDEO_FILENAME,
     };
   }
@@ -232,20 +232,36 @@ export function buildFfmpegCommandString(inputName: string, outputName: string):
   return `ffmpeg -i "${inputName}" ${FFMPEG_LOSSLESS_ARGS.join(' ')} -y "${outputName}"`;
 }
 
-/**
- * Losslessly scrubs MP4 metadata boxes (udta, meta, XMP_, C2PA uuid) and AI generator
- * signatures directly in the browser ArrayBuffer by converting metadata atoms to MP4 `free`
- * padding boxes and zeroing (0x00) their payloads. Preserves exact stco/co64 chunk offsets
- * so video & audio play back without re-encoding even on static hosting (InfinityFree / Vercel).
- */
-export function stripMp4MetadataInBrowser(input: Uint8Array): Uint8Array {
-  const output = new Uint8Array(input.byteLength);
-  output.set(input);
+function readUint32BE(buf: Uint8Array, offset: number): number {
+  return (
+    (((buf[offset] << 24) >>> 0) +
+      (buf[offset + 1] << 16) +
+      (buf[offset + 2] << 8) +
+      buf[offset + 3]) >>>
+    0
+  );
+}
 
+function readBoxType(buf: Uint8Array, offset: number): string {
+  return String.fromCharCode(
+    buf[offset],
+    buf[offset + 1],
+    buf[offset + 2],
+    buf[offset + 3]
+  );
+}
+
+function wipeSignaturesInRange(
+  buf: Uint8Array,
+  startOffset: number,
+  endOffset: number
+) {
+  const length = endOffset - startOffset;
+  if (length <= 0 || length > 8 * 1024 * 1024) return;
+  const slice = buf.subarray(startOffset, endOffset);
   const decoder = new TextDecoder('latin1');
-  const fullText = decoder.decode(output);
+  const text = decoder.decode(slice);
 
-  // 1. Wipe known AI generator and metadata signature substrings with null bytes (0x00)
   const scrubPatterns = [
     /Google\s*Flow[^\0\r\n]{0,64}/gi,
     /Runway[^\0\r\n]{0,64}/gi,
@@ -264,42 +280,104 @@ export function stripMp4MetadataInBrowser(input: Uint8Array): Uint8Array {
 
   for (const regex of scrubPatterns) {
     let match: RegExpExecArray | null;
-    while ((match = regex.exec(fullText)) !== null) {
-      const start = match.index;
-      const len = match[0].length;
-      for (let i = 0; i < len && start + i < output.byteLength; i++) {
-        output[start + i] = 0x00;
+    while ((match = regex.exec(text)) !== null) {
+      const mStart = startOffset + match.index;
+      const mLen = match[0].length;
+      for (let i = 0; i < mLen && mStart + i < endOffset; i++) {
+        buf[mStart + i] = 0x00;
       }
     }
   }
+}
 
-  // 2. Scan for standard MP4 metadata box headers ('udta', 'XMP_', 'c2pa') and convert to 'free' box
-  for (let i = 4; i + 4 <= output.byteLength; i++) {
-    const b0 = output[i];
-    const b1 = output[i + 1];
-    const b2 = output[i + 2];
-    const b3 = output[i + 3];
+function walkAndScrubMp4Boxes(
+  buf: Uint8Array,
+  start: number,
+  end: number,
+  depth = 0
+): boolean {
+  if (depth > 6) return false;
+  let offset = start;
+  let parsedValidBoxes = false;
 
-    const isUdta = b0 === 0x75 && b1 === 0x64 && b2 === 0x74 && b3 === 0x61; // 'udta'
-    const isXmp = b0 === 0x58 && b1 === 0x4d && b2 === 0x50 && b3 === 0x5f; // 'XMP_'
+  const CONTAINER_BOXES = new Set(['moov', 'trak', 'edts', 'mdia', 'minf', 'stbl']);
+  const METADATA_BOXES = new Set(['udta', 'meta', 'XMP_', 'ilst', 'uuid']);
 
-    if (isUdta || isXmp) {
-      const boxSize =
-        ((output[i - 4] << 24) >>> 0) +
-        (output[i - 3] << 16) +
-        (output[i - 2] << 8) +
-        output[i - 1];
+  while (offset + 8 <= end) {
+    let boxSize = readUint32BE(buf, offset);
+    const boxType = readBoxType(buf, offset + 4);
+    let headerSize = 8;
 
-      if (boxSize >= 8 && i - 4 + boxSize <= output.byteLength) {
-        // Rename atom box to 'free' (0x66, 0x72, 0x65, 0x65) and zero out payload
-        output[i] = 0x66;
-        output[i + 1] = 0x72;
-        output[i + 2] = 0x65;
-        output[i + 3] = 0x65;
-        for (let j = i + 4; j < i - 4 + boxSize; j++) {
-          output[j] = 0x00;
-        }
+    // Validate ASCII printable box type
+    const isAsciiType = /^[\x20-\x7E]{4}$/.test(boxType);
+    if (!isAsciiType) {
+      break;
+    }
+
+    if (boxSize === 1) {
+      // 64-bit extended size
+      if (offset + 16 > end) break;
+      const high = readUint32BE(buf, offset + 8);
+      const low = readUint32BE(buf, offset + 12);
+      boxSize = high * 4294967296 + low;
+      headerSize = 16;
+    } else if (boxSize === 0) {
+      // Extends to end of file/container
+      boxSize = end - offset;
+    }
+
+    if (boxSize < headerSize || offset + boxSize > end) {
+      break;
+    }
+
+    parsedValidBoxes = true;
+    const boxEnd = offset + boxSize;
+
+    if (boxType === 'mdat') {
+      // Never modify raw video/audio media frames inside mdat
+      offset = boxEnd;
+      continue;
+    }
+
+    if (METADATA_BOXES.has(boxType)) {
+      // Convert metadata box into an MP4 'free' padding box and zero out its contents.
+      // Preserves exact byte offsets so stco/co64 chunk tables remain 100% valid.
+      buf[offset + 4] = 0x66; // 'f'
+      buf[offset + 5] = 0x72; // 'r'
+      buf[offset + 6] = 0x65; // 'e'
+      buf[offset + 7] = 0x65; // 'e'
+      buf.fill(0x00, offset + headerSize, boxEnd);
+    } else if (CONTAINER_BOXES.has(boxType)) {
+      walkAndScrubMp4Boxes(buf, offset + headerSize, boxEnd, depth + 1);
+      if (boxType === 'moov') {
+        wipeSignaturesInRange(buf, offset + headerSize, boxEnd);
       }
+    }
+
+    offset = boxEnd;
+  }
+
+  return parsedValidBoxes;
+}
+
+/**
+ * Losslessly scrubs MP4/MOV metadata boxes (udta, meta, XMP_, C2PA uuid, ilst) and AI generator
+ * signatures directly in the browser ArrayBuffer by converting metadata atoms to MP4 `free`
+ * padding boxes and zeroing (0x00) their payloads while skipping `mdat` media frames.
+ */
+export function stripMp4MetadataInBrowser(input: Uint8Array): Uint8Array {
+  const output = new Uint8Array(input.byteLength);
+  output.set(input);
+
+  const walked = walkAndScrubMp4Boxes(output, 0, output.byteLength, 0);
+
+  if (!walked) {
+    // Fallback for synthetic or non-standard buffers: scrub first & last 512KB
+    const headEnd = Math.min(output.byteLength, 524288);
+    wipeSignaturesInRange(output, 0, headEnd);
+    if (output.byteLength > 524288) {
+      const tailStart = Math.max(headEnd, output.byteLength - 524288);
+      wipeSignaturesInRange(output, tailStart, output.byteLength);
     }
   }
 
@@ -308,7 +386,7 @@ export function stripMp4MetadataInBrowser(input: Uint8Array): Uint8Array {
 
 /**
  * Generates a compact ISO Base Media (MP4) binary buffer with embedded AI metadata atoms
- * for offline / static hosting testing (e.g. InfinityFree).
+ * for offline / static hosting testing (e.g. InfinityFree / Vercel).
  */
 export function createBrowserSampleMp4Buffer(platform: string): Uint8Array {
   const encoder = new TextEncoder();

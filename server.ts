@@ -203,16 +203,45 @@ async function startServer() {
 
       res.status(200).send(cleanBuffer);
     } catch (error: unknown) {
-      await Promise.all([safeUnlink(inputPath), safeUnlink(outputPath)]);
-      const message =
-        error instanceof Error
-          ? error.message
-          : 'FFmpeg failed to strip metadata from the uploaded file.';
-      console.error('FFmpeg processing error:', message);
-      res.status(422).json({
-        error: 'Unable to process video file. Ensure it is a valid MP4/MOV container.',
-        details: message,
-      });
+      // Fallback: if FFmpeg stream copy encounters a non-standard QuickTime data track,
+      // perform lossless ISO MP4/MOV atom scrubbing directly on the binary buffer so the user never gets an error
+      try {
+        const rawBuf = await fs.promises.readFile(inputPath);
+        const { stripMp4MetadataInBrowser } = await import(
+          './src/utils/metadataAnalyzer.ts'
+        );
+        const scrubbedArr = stripMp4MetadataInBrowser(new Uint8Array(rawBuf));
+        const cleanBuffer = Buffer.from(scrubbedArr);
+        const durationMs = Math.max(1, Date.now() - startTime);
+
+        await Promise.all([safeUnlink(inputPath), safeUnlink(outputPath)]);
+
+        res.setHeader('Content-Type', 'video/mp4');
+        res.setHeader(
+          'Content-Disposition',
+          `attachment; filename="${downloadFileName}"`
+        );
+        res.setHeader('X-Original-Size', String(rawBuf.byteLength));
+        res.setHeader('X-Clean-Size', String(cleanBuffer.byteLength));
+        res.setHeader('X-Process-Duration-Ms', String(durationMs));
+        res.setHeader('X-Clean-Filename', downloadFileName);
+        res.setHeader(
+          'Access-Control-Expose-Headers',
+          'X-Original-Size, X-Clean-Size, X-Process-Duration-Ms, X-Clean-Filename'
+        );
+        res.status(200).send(cleanBuffer);
+      } catch (fallbackErr: unknown) {
+        await Promise.all([safeUnlink(inputPath), safeUnlink(outputPath)]);
+        const message =
+          fallbackErr instanceof Error
+            ? fallbackErr.message
+            : 'Unable to process video file.';
+        console.error('Video processing error:', error, message);
+        res.status(422).json({
+          error: 'Unable to process video file.',
+          details: message,
+        });
+      }
     }
   };
 
