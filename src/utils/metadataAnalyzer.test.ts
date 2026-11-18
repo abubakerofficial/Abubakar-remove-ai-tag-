@@ -6,6 +6,8 @@ import {
   inspectBinaryForAiMetadata,
   buildFfmpegCommandString,
   FFMPEG_LOSSLESS_ARGS,
+  stripMp4MetadataInBrowser,
+  createBrowserSampleMp4Buffer,
 } from './metadataAnalyzer';
 
 test('validateVideoFile accepts valid MP4 files and automatically renames to Abubakar Remove AI.mp4', () => {
@@ -55,3 +57,15 @@ test('buildFfmpegCommandString includes lossless stream copy and metadata strip 
   assert.ok(cmd.includes('-c:a copy'));
   assert.ok(FFMPEG_LOSSLESS_ARGS.includes('-map_metadata'));
 });
+
+test('stripMp4MetadataInBrowser removes all AI signatures from sample MP4 buffer for static hosting', () => {
+  const sampleBuf = createBrowserSampleMp4Buffer('runway');
+  const beforeTags = inspectBinaryForAiMetadata(sampleBuf, 'sample.mp4');
+  assert.equal(beforeTags.length, 6);
+
+  const cleanedBuf = stripMp4MetadataInBrowser(sampleBuf);
+  const decoder = new TextDecoder('latin1');
+  const cleanedText = decoder.decode(cleanedBuf);
+  assert.equal(/Runway|Google Flow|Luma|Pika|c2pa/i.test(cleanedText), false);
+});
+

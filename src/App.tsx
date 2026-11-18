@@ -23,6 +23,8 @@ import {
   validateVideoFile,
   formatBytes,
   inspectBinaryForAiMetadata,
+  stripMp4MetadataInBrowser,
+  createBrowserSampleMp4Buffer,
 } from './utils/metadataAnalyzer';
 import { MetadataInspector } from './components/MetadataInspector';
 
@@ -114,20 +116,30 @@ export default function App() {
   ) => {
     setIsGeneratingSample(platformKey);
     try {
-      const response = await fetch(`/api/sample-ai-video?platform=${platformKey}`);
-      if (!response.ok) {
-        throw new Error('Could not generate sample AI MP4 clip.');
+      let blob: Blob;
+      let fileNameHeader = `Sample_${platformKey}_AI_Video.mp4`;
+
+      try {
+        const response = await fetch(`/api/sample-ai-video?platform=${platformKey}`);
+        const contentType = response.headers.get('Content-Type') || '';
+        if (!response.ok || !contentType.includes('video/mp4')) {
+          throw new Error('Static host mode');
+        }
+        fileNameHeader =
+          response.headers.get('X-Sample-Filename') || fileNameHeader;
+        blob = await response.blob();
+      } catch {
+        // Fallback for static hosting (InfinityFree / Vercel static dist)
+        const sampleBytes = createBrowserSampleMp4Buffer(platformKey);
+        blob = new Blob([sampleBytes as unknown as BlobPart], { type: 'video/mp4' });
       }
-      const fileNameHeader =
-        response.headers.get('X-Sample-Filename') ||
-        `Sample_${platformKey}_AI_Video.mp4`;
-      const blob = await response.blob();
+
       const sampleFile = new File([blob], fileNameHeader, { type: 'video/mp4' });
       await inspectAndStageFile(sampleFile);
       triggerToast(
         'success',
         'Video Loaded & Auto-Renamed',
-        'Video file name automatically set to "Abubakar Remove AI.mp4" and ready for FFmpeg metadata stripping.'
+        'Video file name automatically set to "Abubakar Remove AI.mp4" and ready for metadata stripping.'
       );
     } catch (err: unknown) {
       triggerToast(
@@ -146,6 +158,7 @@ export default function App() {
     setIsProcessing(true);
     setProgress(15);
     setStepIndex(0);
+    const startTime = performance.now();
 
     const progressTimer = setInterval(() => {
       setProgress((prev) => {
@@ -155,35 +168,47 @@ export default function App() {
         else if (next >= 25) setStepIndex(1);
         return next;
       });
-    }, 160);
+    }, 140);
 
     try {
-      const formData = new FormData();
-      formData.append('video', selectedFile);
+      let cleanBlob: Blob;
+      let cleanBuffer: Uint8Array;
+      let serverDuration = 0;
+      let outName = cleanFileName || 'Abubakar Remove AI.mp4';
 
-      const response = await fetch('/api/strip-metadata', {
-        method: 'POST',
-        body: formData,
-      });
+      try {
+        const formData = new FormData();
+        formData.append('video', selectedFile);
 
-      if (!response.ok) {
-        const errData = await response.json().catch(() => ({}));
-        throw new Error(
-          errData.error || 'FFmpeg failed to strip metadata from the video.'
+        const response = await fetch('/api/strip-metadata', {
+          method: 'POST',
+          body: formData,
+        });
+
+        const contentType = response.headers.get('Content-Type') || '';
+        if (!response.ok || !contentType.includes('video/mp4')) {
+          throw new Error('Static host fallback');
+        }
+
+        cleanBlob = await response.blob();
+        cleanBuffer = new Uint8Array(await cleanBlob.arrayBuffer());
+        serverDuration = Number(
+          response.headers.get('X-Process-Duration-Ms') ||
+            Math.max(12, Math.round(performance.now() - startTime))
         );
+        outName =
+          response.headers.get('X-Clean-Filename') ||
+          'Abubakar Remove AI.mp4';
+      } catch {
+        // 100% Client-Side Lossless Binary Scrubber for InfinityFree / Static Hosting
+        const rawBytes = new Uint8Array(await selectedFile.arrayBuffer());
+        cleanBuffer = stripMp4MetadataInBrowser(rawBytes);
+        cleanBlob = new Blob([cleanBuffer as unknown as BlobPart], { type: 'video/mp4' });
+        serverDuration = Math.max(8, Math.round(performance.now() - startTime));
+        outName = 'Abubakar Remove AI.mp4';
       }
 
-      const cleanBlob = await response.blob();
-      const cleanBuffer = new Uint8Array(await cleanBlob.arrayBuffer());
       const url = URL.createObjectURL(cleanBlob);
-
-      const serverDuration = Number(
-        response.headers.get('X-Process-Duration-Ms') || 42
-      );
-      const outName =
-        response.headers.get('X-Clean-Filename') ||
-        cleanFileName ||
-        'clean_video.mp4';
 
       clearInterval(progressTimer);
       setProgress(100);
@@ -222,7 +247,7 @@ export default function App() {
       setProgress(0);
       triggerToast(
         'error',
-        'FFmpeg Processing Failed',
+        'Processing Failed',
         error instanceof Error
           ? error.message
           : 'Could not strip metadata from this file.'
@@ -750,8 +775,22 @@ export default function App() {
       {/* Quiet Footer */}
       <footer className="border-t border-slate-800/80 py-6 px-6 lg:px-10 text-xs text-slate-400">
         <div className="max-w-6xl mx-auto flex flex-wrap items-center justify-between gap-4">
-          <span>Abubakar AI File Remover · Lossless FFmpeg Video Metadata Scrubber</span>
-          <span>Zero Re-Encoding · Immediate Temp File Cleanup</span>
+          <span>Abubakar AI File Remover · Lossless Video Metadata Scrubber</span>
+          <div className="flex flex-wrap items-center gap-4">
+            <span>Zero Re-Encoding · Immediate Temp File Cleanup</span>
+            {(typeof window !== 'undefined' &&
+              (window.location.hostname === 'localhost' ||
+                window.location.hostname.endsWith('.run.app'))) && (
+              <a
+                href="/api/download-dist"
+                download="abubakar-infinityfree-dist.zip"
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-emerald-500/40 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-300 font-medium text-xs transition-colors whitespace-nowrap"
+              >
+                <Download className="w-3.5 h-3.5" />
+                <span>Download dist.zip (InfinityFree / Vercel)</span>
+              </a>
+            )}
+          </div>
         </div>
       </footer>
     </div>

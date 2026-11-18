@@ -219,6 +219,21 @@ async function startServer() {
   app.post('/api/strip-metadata', upload.single('video'), handleStripMetadata);
   app.post('/api/remove-metadata', upload.single('video'), handleStripMetadata);
 
+  app.get('/api/download-dist', async (_req: Request, res: Response) => {
+    const zipPath = path.join(process.cwd(), 'abubakar-infinityfree-dist.zip');
+    if (!fs.existsSync(zipPath)) {
+      res.status(404).json({ error: 'dist.zip package not found.' });
+      return;
+    }
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader(
+      'Content-Disposition',
+      'attachment; filename="abubakar-infinityfree-dist.zip"'
+    );
+    const zipBuffer = await fs.promises.readFile(zipPath);
+    res.status(200).send(zipBuffer);
+  });
+
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
       server: { middlewareMode: true },

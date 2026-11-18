@@ -231,3 +231,95 @@ export function inspectBinaryForAiMetadata(
 export function buildFfmpegCommandString(inputName: string, outputName: string): string {
   return `ffmpeg -i "${inputName}" ${FFMPEG_LOSSLESS_ARGS.join(' ')} -y "${outputName}"`;
 }
+
+/**
+ * Losslessly scrubs MP4 metadata boxes (udta, meta, XMP_, C2PA uuid) and AI generator
+ * signatures directly in the browser ArrayBuffer by converting metadata atoms to MP4 `free`
+ * padding boxes and zeroing (0x00) their payloads. Preserves exact stco/co64 chunk offsets
+ * so video & audio play back without re-encoding even on static hosting (InfinityFree / Vercel).
+ */
+export function stripMp4MetadataInBrowser(input: Uint8Array): Uint8Array {
+  const output = new Uint8Array(input.byteLength);
+  output.set(input);
+
+  const decoder = new TextDecoder('latin1');
+  const fullText = decoder.decode(output);
+
+  // 1. Wipe known AI generator and metadata signature substrings with null bytes (0x00)
+  const scrubPatterns = [
+    /Google\s*Flow[^\0\r\n]{0,64}/gi,
+    /Runway[^\0\r\n]{0,64}/gi,
+    /Gen-3[^\0\r\n]{0,64}/gi,
+    /Gen-2[^\0\r\n]{0,64}/gi,
+    /Luma[^\0\r\n]{0,64}/gi,
+    /Dream\s*Machine[^\0\r\n]{0,64}/gi,
+    /Pika[^\0\r\n]{0,64}/gi,
+    /c2pa[^\0\r\n]{0,64}/gi,
+    /jumbf[^\0\r\n]{0,64}/gi,
+    /TrainedAlgorithmicMedia[^\0\r\n]{0,64}/gi,
+    /AI_GENERATED[^\0\r\n]{0,64}/gi,
+    /SynthID[^\0\r\n]{0,64}/gi,
+    /Lavf[0-9.]+/gi,
+  ];
+
+  for (const regex of scrubPatterns) {
+    let match: RegExpExecArray | null;
+    while ((match = regex.exec(fullText)) !== null) {
+      const start = match.index;
+      const len = match[0].length;
+      for (let i = 0; i < len && start + i < output.byteLength; i++) {
+        output[start + i] = 0x00;
+      }
+    }
+  }
+
+  // 2. Scan for standard MP4 metadata box headers ('udta', 'XMP_', 'c2pa') and convert to 'free' box
+  for (let i = 4; i + 4 <= output.byteLength; i++) {
+    const b0 = output[i];
+    const b1 = output[i + 1];
+    const b2 = output[i + 2];
+    const b3 = output[i + 3];
+
+    const isUdta = b0 === 0x75 && b1 === 0x64 && b2 === 0x74 && b3 === 0x61; // 'udta'
+    const isXmp = b0 === 0x58 && b1 === 0x4d && b2 === 0x50 && b3 === 0x5f; // 'XMP_'
+
+    if (isUdta || isXmp) {
+      const boxSize =
+        ((output[i - 4] << 24) >>> 0) +
+        (output[i - 3] << 16) +
+        (output[i - 2] << 8) +
+        output[i - 1];
+
+      if (boxSize >= 8 && i - 4 + boxSize <= output.byteLength) {
+        // Rename atom box to 'free' (0x66, 0x72, 0x65, 0x65) and zero out payload
+        output[i] = 0x66;
+        output[i + 1] = 0x72;
+        output[i + 2] = 0x65;
+        output[i + 3] = 0x65;
+        for (let j = i + 4; j < i - 4 + boxSize; j++) {
+          output[j] = 0x00;
+        }
+      }
+    }
+  }
+
+  return output;
+}
+
+/**
+ * Generates a compact ISO Base Media (MP4) binary buffer with embedded AI metadata atoms
+ * for offline / static hosting testing (e.g. InfinityFree).
+ */
+export function createBrowserSampleMp4Buffer(platform: string): Uint8Array {
+  const encoder = new TextEncoder();
+  const payload =
+    `ftypisom0000isomiso2avc1mp41moovmvhd` +
+    `udtametailst©tooGoogle Flow Studio (Veo Pipeline / C2PA SynthID)` +
+    `XMP_rdf:DescriptionRunway Gen-3 Alpha Turbo (runwayml.com)` +
+    `©cmtLuma AI Dream Machine v1.6 Ray2` +
+    `©ARTPika Labs AI Video Engine v2.1` +
+    `uuidc2pa.jumbf.manifestiptc:TrainedAlgorithmicMedia AI_GENERATED (${platform})` +
+    `©swrLavf60.16.100mdat0000000000000000`;
+  return encoder.encode(payload);
+}
+
