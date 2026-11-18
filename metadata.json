@@ -1,0 +1,6 @@
+{
+  "name": "Abubakar AI File Remover",
+  "description": "High-speed lossless MP4 metadata scrubber that removes EXIF, XMP, C2PA, and AI generator tags from Google Flow, Runway, Luma, and Pika videos using FFmpeg stream copy.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
