@@ -1,5 +1,5 @@
 import React from 'react';
-import { ShieldAlert, ShieldCheck, Check, Terminal } from 'lucide-react';
+import { ShieldAlert, ShieldCheck, Check } from 'lucide-react';
 import { DetectedMetadataTag, formatBytes } from '../utils/metadataAnalyzer';
 
 interface MetadataInspectorProps {
@@ -9,7 +9,6 @@ interface MetadataInspectorProps {
   durationMs: number | null;
   detectedTags: DetectedMetadataTag[];
   isCleaned: boolean;
-  ffmpegCommand: string;
 }
 
 export const MetadataInspector: React.FC<MetadataInspectorProps> = ({
@@ -19,7 +18,6 @@ export const MetadataInspector: React.FC<MetadataInspectorProps> = ({
   durationMs,
   detectedTags,
   isCleaned,
-  ffmpegCommand,
 }) => {
   const bytesRemoved =
     cleanSize !== null ? Math.max(0, originalSize - cleanSize) : null;
@@ -72,7 +70,7 @@ export const MetadataInspector: React.FC<MetadataInspectorProps> = ({
               <th className="py-2.5 px-5">Source / Platform</th>
               <th className="py-2.5 px-4">Metadata Tag &amp; Atom Box</th>
               <th className="py-2.5 px-4">Before (Uploaded MP4)</th>
-              <th className="py-2.5 px-5 text-right">After (FFmpeg Stream Copy)</th>
+              <th className="py-2.5 px-5 text-right">After (Clean Output)</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-slate-800/60 text-xs">
@@ -106,17 +104,14 @@ export const MetadataInspector: React.FC<MetadataInspectorProps> = ({
         </table>
       </div>
 
-      <div className="px-5 py-3 bg-[#090D16]/70 border-t border-slate-800 flex flex-wrap items-center justify-between gap-3 text-xs text-slate-400">
-        <div className="flex items-center gap-2 font-mono text-[11px] text-slate-300 overflow-x-auto">
-          <Terminal className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-          <code className="whitespace-nowrap">{ffmpegCommand}</code>
+      {bytesRemoved !== null && (
+        <div className="px-5 py-3 bg-[#090D16]/70 border-t border-slate-800 flex items-center justify-between gap-3 text-xs text-slate-400">
+          <span>Privacy Protected · Zero Server Retention</span>
+          <span className="font-mono tabular-nums text-[11px] text-emerald-400">
+            Video &amp; Audio Bitstream: 100% Original Quality
+          </span>
         </div>
-        {bytesRemoved !== null && (
-          <div className="font-mono tabular-nums text-[11px] text-slate-400">
-            Video &amp; Audio Bitstream: 100% Bit-Exact Copy
-          </div>
-        )}
-      </div>
+      )}
     </div>
   );
 };

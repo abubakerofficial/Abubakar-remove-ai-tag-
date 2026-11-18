@@ -23,10 +23,8 @@ import {
   validateVideoFile,
   formatBytes,
   inspectBinaryForAiMetadata,
-  buildFfmpegCommandString,
 } from './utils/metadataAnalyzer';
 import { MetadataInspector } from './components/MetadataInspector';
-import { NextJsCodeDrawer } from './components/NextJsCodeDrawer';
 
 interface ProcessedHistoryItem {
   id: string;
@@ -246,10 +244,6 @@ export default function App() {
     }
   };
 
-  const ffmpegCommand = selectedFile
-    ? buildFfmpegCommandString(selectedFile.name, cleanFileName)
-    : 'ffmpeg -i input.mp4 -map_metadata -1 -map_chapters -1 -c:v copy -c:a copy -movflags +faststart clean_output.mp4';
-
   return (
     <div className="min-h-screen bg-[#090D16] text-slate-100 flex flex-col">
       {/* Top Bar Contract: 3 zones separated by gap-8 */}
@@ -282,12 +276,6 @@ export default function App() {
             className="hover:text-slate-100 transition-colors whitespace-nowrap shrink-0"
           >
             Processed Queue
-          </a>
-          <a
-            href="#nextjs-blueprint"
-            className="hover:text-slate-100 transition-colors whitespace-nowrap shrink-0"
-          >
-            Next.js 14 Code
           </a>
         </nav>
 
@@ -641,13 +629,13 @@ export default function App() {
                 </div>
               </div>
 
-              <div className="rounded-lg bg-[#090D16] border border-slate-800 p-3.5 space-y-1.5">
-                <p className="text-[11px] font-medium text-slate-300">
-                  Executed FFmpeg Pipeline Parameters
+              <div className="rounded-lg bg-[#090D16] border border-slate-800 p-3.5 space-y-1">
+                <p className="text-[11px] font-medium text-emerald-400">
+                  Lossless Bit-Exact Processing Engine
                 </p>
-                <code className="block font-mono text-[11px] text-emerald-400 leading-relaxed">
-                  ffmpeg -i input.mp4 -map_metadata -1 -map_chapters -1 -c:v copy -c:a copy -fflags +bitexact -movflags +faststart clean.mp4
-                </code>
+                <p className="text-xs text-slate-400 leading-relaxed">
+                  Strips all AI metadata signatures while keeping 100% original video and audio quality without re-encoding.
+                </p>
               </div>
             </div>
           </div>
@@ -661,7 +649,6 @@ export default function App() {
               durationMs={processDurationMs}
               detectedTags={detectedTags}
               isCleaned={Boolean(cleanDownloadUrl)}
-              ffmpegCommand={ffmpegCommand}
             />
           )}
         </section>
@@ -718,7 +705,7 @@ export default function App() {
                       <th className="py-2.5 px-5">Clean Output File</th>
                       <th className="py-2.5 px-4">Tags Removed</th>
                       <th className="py-2.5 px-4 text-right">Size</th>
-                      <th className="py-2.5 px-4 text-right">FFmpeg Time</th>
+                      <th className="py-2.5 px-4 text-right">Processing Time</th>
                       <th className="py-2.5 px-5 text-right">Action</th>
                     </tr>
                   </thead>
@@ -758,9 +745,6 @@ export default function App() {
             </div>
           )}
         </section>
-
-        {/* Next.js 14 Full-Stack Source Code Blueprint Drawer */}
-        <NextJsCodeDrawer />
       </main>
 
       {/* Quiet Footer */}
