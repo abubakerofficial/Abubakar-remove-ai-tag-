@@ -1,9 +1,14 @@
 import React from 'react';
 import { ShieldAlert, ShieldCheck, Check } from 'lucide-react';
-import { DetectedMetadataTag, formatBytes } from '../utils/metadataAnalyzer';
+import {
+  DetectedMetadataTag,
+  MediaKind,
+  formatBytes,
+} from '../utils/metadataAnalyzer';
 
 interface MetadataInspectorProps {
   fileName: string;
+  mediaKind: MediaKind;
   originalSize: number;
   cleanSize: number | null;
   durationMs: number | null;
@@ -13,6 +18,7 @@ interface MetadataInspectorProps {
 
 export const MetadataInspector: React.FC<MetadataInspectorProps> = ({
   fileName,
+  mediaKind,
   originalSize,
   cleanSize,
   durationMs,
@@ -27,7 +33,9 @@ export const MetadataInspector: React.FC<MetadataInspectorProps> = ({
       <div className="px-5 py-4 border-b border-slate-800 flex flex-wrap items-center justify-between gap-4">
         <div>
           <h3 className="text-sm font-semibold text-slate-100 font-display">
-            MP4 Container Atom &amp; AI Signature Audit
+            {mediaKind === 'image'
+              ? 'Picture EXIF / XMP / C2PA Signature Audit'
+              : 'MP4 Container Atom & AI Signature Audit'}
           </h3>
           <p className="text-xs text-slate-400 mt-0.5">
             Target file: <span className="font-mono text-slate-300">{fileName}</span>
@@ -68,8 +76,10 @@ export const MetadataInspector: React.FC<MetadataInspectorProps> = ({
           <thead>
             <tr className="border-b border-slate-800/80 text-[11px] font-medium text-slate-400 bg-slate-900/40">
               <th className="py-2.5 px-5">Source / Platform</th>
-              <th className="py-2.5 px-4">Metadata Tag &amp; Atom Box</th>
-              <th className="py-2.5 px-4">Before (Uploaded MP4)</th>
+              <th className="py-2.5 px-4">Metadata Tag &amp; Segment</th>
+              <th className="py-2.5 px-4">
+                {mediaKind === 'image' ? 'Before (Uploaded Picture)' : 'Before (Uploaded Video)'}
+              </th>
               <th className="py-2.5 px-5 text-right">After (Clean Output)</th>
             </tr>
           </thead>
@@ -108,7 +118,9 @@ export const MetadataInspector: React.FC<MetadataInspectorProps> = ({
         <div className="px-5 py-3 bg-[#090D16]/70 border-t border-slate-800 flex items-center justify-between gap-3 text-xs text-slate-400">
           <span>Privacy Protected · Zero Server Retention</span>
           <span className="font-mono tabular-nums text-[11px] text-emerald-400">
-            Video &amp; Audio Bitstream: 100% Original Quality
+            {mediaKind === 'image'
+              ? 'Image Pixels: 100% Original Quality'
+              : 'Video & Audio Bitstream: 100% Original Quality'}
           </span>
         </div>
       )}

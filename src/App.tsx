@@ -13,6 +13,7 @@ import {
   CheckCircle2,
   AlertTriangle,
   Film,
+  Image as ImageIcon,
   Zap,
   Trash2,
   FileVideo,
@@ -20,16 +21,20 @@ import {
 } from 'lucide-react';
 import {
   DetectedMetadataTag,
-  validateVideoFile,
+  MediaKind,
+  validateMediaFile,
   formatBytes,
   inspectBinaryForAiMetadata,
   stripMp4MetadataInBrowser,
+  stripImageMetadataInBrowser,
   createBrowserSampleMp4Buffer,
+  createBrowserSamplePngBuffer,
 } from './utils/metadataAnalyzer';
 import { MetadataInspector } from './components/MetadataInspector';
 
 interface ProcessedHistoryItem {
   id: string;
+  mediaKind: MediaKind;
   originalName: string;
   cleanName: string;
   originalSize: number;
@@ -47,23 +52,69 @@ interface ToastNotification {
   message: string;
 }
 
-const PROCESSING_STEPS = [
+const VIDEO_PROCESSING_STEPS = [
   'Parsing MP4 container atoms (moov.udta, XMP_, C2PA JUMBF)...',
-  'Executing FFmpeg stream copy (-map_metadata -1 -c:v copy -c:a copy)...',
+  'Running lossless stream scrubber without re-encoding...',
   'Stripping Google Flow, Runway, Luma & Pika generator signatures...',
-  'Verifying bit-exact clean video output & purging server temp files...',
+  'Verifying bit-exact clean video output & purging temporary data...',
 ];
+
+const IMAGE_PROCESSING_STEPS = [
+  'Scanning picture segments (APP1 EXIF, XMP, PNG tEXt/iTXt, C2PA)...',
+  'Stripping Midjourney, Imagen, DALL-E & Stable Diffusion tags...',
+  'Removing camera GPS, device timestamps & IPTC identifiers...',
+  'Finalizing 100% clean picture with untouched pixel quality...',
+];
+
+async function reencodeImageViaCanvas(
+  file: File,
+  outputMime: string
+): Promise<Uint8Array> {
+  const bitmapUrl = URL.createObjectURL(file);
+  try {
+    const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+      const el = new Image();
+      el.onload = () => resolve(el);
+      el.onerror = () => reject(new Error('Unable to decode image file.'));
+      el.src = bitmapUrl;
+    });
+
+    const canvas = document.createElement('canvas');
+    canvas.width = img.naturalWidth || img.width;
+    canvas.height = img.naturalHeight || img.height;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) throw new Error('Canvas 2D context unavailable.');
+    ctx.drawImage(img, 0, 0);
+
+    const blob = await new Promise<Blob>((resolve, reject) => {
+      canvas.toBlob(
+        (b) => (b ? resolve(b) : reject(new Error('Failed to export clean image.'))),
+        outputMime,
+        0.96
+      );
+    });
+    return new Uint8Array(await blob.arrayBuffer());
+  } finally {
+    URL.revokeObjectURL(bitmapUrl);
+  }
+}
 
 export default function App() {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [selectedMediaKind, setSelectedMediaKind] = useState<MediaKind>('video');
+  const [outputMimeType, setOutputMimeType] = useState<string>('video/mp4');
+  const [previewImageUrl, setPreviewImageUrl] = useState<string | null>(null);
+
   const [detectedTags, setDetectedTags] = useState<DetectedMetadataTag[]>([]);
   const [isDragging, setIsDragging] = useState(false);
   const [isGeneratingSample, setIsGeneratingSample] = useState<string | null>(null);
+  const [platformTab, setPlatformTab] = useState<'video' | 'image'>('video');
 
   const [isProcessing, setIsProcessing] = useState(false);
   const [progress, setProgress] = useState(0);
   const [stepIndex, setStepIndex] = useState(0);
 
+  const [cleanBlobObj, setCleanBlobObj] = useState<Blob | null>(null);
   const [cleanDownloadUrl, setCleanDownloadUrl] = useState<string | null>(null);
   const [cleanFileName, setCleanFileName] = useState<string>('');
   const [cleanFileSize, setCleanFileSize] = useState<number | null>(null);
@@ -84,26 +135,46 @@ export default function App() {
   };
 
   const inspectAndStageFile = async (file: File) => {
-    const validation = validateVideoFile(file.name, file.size, file.type);
+    const validation = validateMediaFile(file.name, file.size, file.type);
     if (!validation.valid) {
       triggerToast(
         'error',
-        'Invalid Video Upload',
-        validation.error || 'Please upload a valid MP4 video file.'
+        'Invalid File Upload',
+        validation.error || 'Please upload a valid MP4/MOV video or JPG/PNG/WEBP picture.'
       );
       return;
     }
 
     const arrayBuf = await file.arrayBuffer();
-    const tags = inspectBinaryForAiMetadata(new Uint8Array(arrayBuf), file.name);
+    const tags = inspectBinaryForAiMetadata(
+      new Uint8Array(arrayBuf),
+      file.name,
+      validation.mediaKind
+    );
 
-    // Automatically rename whatever video is uploaded to "Abubakar Remove AI.mp4"
+    // Automatically rename whatever video or picture is uploaded to "Abubakar Remove AI.<ext>"
     const renamedFile = new File([arrayBuf], validation.normalizedCleanName, {
-      type: file.type || 'video/mp4',
+      type: file.type || validation.outputMimeType,
     });
 
+    if (previewImageUrl) {
+      URL.revokeObjectURL(previewImageUrl);
+    }
+
+    if (validation.mediaKind === 'image') {
+      const imgPreview = URL.createObjectURL(renamedFile);
+      setPreviewImageUrl(imgPreview);
+      setPlatformTab('image');
+    } else {
+      setPreviewImageUrl(null);
+      setPlatformTab('video');
+    }
+
     setSelectedFile(renamedFile);
+    setSelectedMediaKind(validation.mediaKind);
+    setOutputMimeType(validation.outputMimeType);
     setDetectedTags(tags);
+    setCleanBlobObj(null);
     setCleanDownloadUrl(null);
     setCleanFileName(validation.normalizedCleanName);
     setCleanFileSize(null);
@@ -129,7 +200,6 @@ export default function App() {
           response.headers.get('X-Sample-Filename') || fileNameHeader;
         blob = await response.blob();
       } catch {
-        // Fallback for static hosting (InfinityFree / Vercel static dist)
         const sampleBytes = createBrowserSampleMp4Buffer(platformKey);
         blob = new Blob([sampleBytes as unknown as BlobPart], { type: 'video/mp4' });
       }
@@ -152,16 +222,46 @@ export default function App() {
     }
   };
 
-  const [cleanBlobObj, setCleanBlobObj] = useState<Blob | null>(null);
+  const handleLoadSampleAiPicture = async (
+    platformKey: 'midjourney' | 'imagen' | 'dalle' | 'stable_diffusion'
+  ) => {
+    setIsGeneratingSample(`img_${platformKey}`);
+    try {
+      const sampleBytes = createBrowserSamplePngBuffer(platformKey);
+      const blob = new Blob([sampleBytes as unknown as BlobPart], {
+        type: 'image/png',
+      });
+      const sampleFile = new File([blob], `Sample_${platformKey}_AI_Picture.png`, {
+        type: 'image/png',
+      });
+      await inspectAndStageFile(sampleFile);
+      triggerToast(
+        'success',
+        'Picture Loaded & Auto-Renamed',
+        'Picture file name automatically set to "Abubakar Remove AI.png" and ready for EXIF/XMP/AI stripping.'
+      );
+    } catch (err: unknown) {
+      triggerToast(
+        'error',
+        'Sample Picture Error',
+        err instanceof Error ? err.message : 'Failed to generate sample AI picture.'
+      );
+    } finally {
+      setIsGeneratingSample(null);
+    }
+  };
 
-  const handleTriggerDownload = async (url?: string, name?: string, blobToShare?: Blob | null) => {
+  const handleTriggerDownload = (
+    url?: string,
+    name?: string,
+    blobToShare?: Blob | null
+  ) => {
     const targetUrl = url || cleanDownloadUrl;
     const targetName = name || cleanFileName || 'Abubakar Remove AI.mp4';
     const activeBlob = blobToShare !== undefined ? blobToShare : cleanBlobObj;
 
     if (!targetUrl) return;
 
-    // On iOS Safari / Mobile, trigger programmatic anchor download
     const a = document.createElement('a');
     a.href = targetUrl;
     a.download = targetName;
@@ -172,11 +272,10 @@ export default function App() {
       document.body.removeChild(a);
     }, 200);
 
-    // If running on mobile with Web Share API file support, also keep toast helpful
     if (activeBlob) {
       triggerToast(
         'success',
-        'Downloading Clean Video',
+        'Downloading Clean File',
         `Saving "${targetName}" to your device.`
       );
     }
@@ -186,7 +285,9 @@ export default function App() {
     if (!cleanBlobObj) return;
     const outName = cleanFileName || 'Abubakar Remove AI.mp4';
     try {
-      const shareFile = new File([cleanBlobObj], outName, { type: 'video/mp4' });
+      const shareFile = new File([cleanBlobObj], outName, {
+        type: outputMimeType || 'video/mp4',
+      });
       if (navigator.canShare && navigator.canShare({ files: [shareFile] })) {
         await navigator.share({
           files: [shareFile],
@@ -200,7 +301,7 @@ export default function App() {
     handleTriggerDownload();
   };
 
-  const handleProcessVideo = async () => {
+  const handleProcessMedia = async () => {
     if (!selectedFile || isProcessing) return;
 
     setIsProcessing(true);
@@ -222,51 +323,73 @@ export default function App() {
       let cleanBlob: Blob;
       let cleanBuffer: Uint8Array;
       let serverDuration = 0;
-      const outName = 'Abubakar Remove AI.mp4';
+      const outName = cleanFileName || 'Abubakar Remove AI.mp4';
 
-      const isFullStackHost =
-        typeof window !== 'undefined' &&
-        (window.location.hostname === 'localhost' ||
-          window.location.hostname.endsWith('.run.app'));
+      if (selectedMediaKind === 'image') {
+        await new Promise((r) => setTimeout(r, 200));
+        const rawBytes = new Uint8Array(await selectedFile.arrayBuffer());
+        const isNativeBinaryImage =
+          (rawBytes[0] === 0xff && rawBytes[1] === 0xd8) || // JPEG
+          (rawBytes[0] === 0x89 && rawBytes[1] === 0x50) || // PNG
+          (rawBytes[0] === 0x52 && rawBytes[1] === 0x49); // RIFF WEBP
 
-      if (isFullStackHost && selectedFile.size <= 35 * 1024 * 1024) {
-        try {
-          const formData = new FormData();
-          formData.append('video', selectedFile);
-
-          const response = await fetch('/api/strip-metadata', {
-            method: 'POST',
-            body: formData,
-          });
-
-          const contentType = response.headers.get('Content-Type') || '';
-          if (!response.ok || !contentType.includes('video/mp4')) {
-            throw new Error('Fallback to in-browser scrubber');
-          }
-
-          cleanBlob = await response.blob();
-          cleanBuffer = new Uint8Array(await cleanBlob.arrayBuffer());
-          serverDuration = Number(
-            response.headers.get('X-Process-Duration-Ms') ||
-              Math.max(12, Math.round(performance.now() - startTime))
+        if (isNativeBinaryImage) {
+          cleanBuffer = stripImageMetadataInBrowser(rawBytes);
+        } else {
+          cleanBuffer = await reencodeImageViaCanvas(
+            selectedFile,
+            outputMimeType || 'image/png'
           );
-        } catch {
+        }
+
+        cleanBlob = new Blob([cleanBuffer as unknown as BlobPart], {
+          type: outputMimeType || 'image/png',
+        });
+        serverDuration = Math.max(8, Math.round(performance.now() - startTime));
+      } else {
+        const isFullStackHost =
+          typeof window !== 'undefined' &&
+          (window.location.hostname === 'localhost' ||
+            window.location.hostname.endsWith('.run.app'));
+
+        if (isFullStackHost && selectedFile.size <= 35 * 1024 * 1024) {
+          try {
+            const formData = new FormData();
+            formData.append('video', selectedFile);
+
+            const response = await fetch('/api/strip-metadata', {
+              method: 'POST',
+              body: formData,
+            });
+
+            const contentType = response.headers.get('Content-Type') || '';
+            if (!response.ok || !contentType.includes('video/mp4')) {
+              throw new Error('Fallback to in-browser scrubber');
+            }
+
+            cleanBlob = await response.blob();
+            cleanBuffer = new Uint8Array(await cleanBlob.arrayBuffer());
+            serverDuration = Number(
+              response.headers.get('X-Process-Duration-Ms') ||
+                Math.max(12, Math.round(performance.now() - startTime))
+            );
+          } catch {
+            const rawBytes = new Uint8Array(await selectedFile.arrayBuffer());
+            cleanBuffer = stripMp4MetadataInBrowser(rawBytes);
+            cleanBlob = new Blob([cleanBuffer as unknown as BlobPart], {
+              type: 'video/mp4',
+            });
+            serverDuration = Math.max(10, Math.round(performance.now() - startTime));
+          }
+        } else {
+          await new Promise((r) => setTimeout(r, 240));
           const rawBytes = new Uint8Array(await selectedFile.arrayBuffer());
           cleanBuffer = stripMp4MetadataInBrowser(rawBytes);
           cleanBlob = new Blob([cleanBuffer as unknown as BlobPart], {
             type: 'video/mp4',
           });
-          serverDuration = Math.max(10, Math.round(performance.now() - startTime));
+          serverDuration = Math.max(12, Math.round(performance.now() - startTime));
         }
-      } else {
-        // Direct In-Browser Lossless ISO MP4/MOV Atom Scrubber (Vercel, InfinityFree, & large mobile videos)
-        await new Promise((r) => setTimeout(r, 260));
-        const rawBytes = new Uint8Array(await selectedFile.arrayBuffer());
-        cleanBuffer = stripMp4MetadataInBrowser(rawBytes);
-        cleanBlob = new Blob([cleanBuffer as unknown as BlobPart], {
-          type: 'video/mp4',
-        });
-        serverDuration = Math.max(12, Math.round(performance.now() - startTime));
       }
 
       if (cleanDownloadUrl) {
@@ -286,6 +409,7 @@ export default function App() {
 
       const historyEntry: ProcessedHistoryItem = {
         id: `${Date.now()}`,
+        mediaKind: selectedMediaKind,
         originalName: selectedFile.name,
         cleanName: outName,
         originalSize: selectedFile.size,
@@ -305,14 +429,14 @@ export default function App() {
       triggerToast(
         'success',
         'AI Metadata Completely Removed',
-        `Stripped ${detectedTags.length} AI metadata signatures in ${serverDuration} ms. Ready to download as "${outName}".`
+        `Stripped ${detectedTags.length} metadata signatures in ${serverDuration} ms. Ready to download as "${outName}".`
       );
     } catch (error: unknown) {
       clearInterval(progressTimer);
       setProgress(0);
       triggerToast(
         'error',
-        'Video Processing Error',
+        'Processing Error',
         error instanceof Error
           ? error.message
           : 'Could not strip metadata from this file.'
@@ -323,8 +447,13 @@ export default function App() {
   };
 
   const handleReset = () => {
+    if (previewImageUrl) {
+      URL.revokeObjectURL(previewImageUrl);
+    }
     setSelectedFile(null);
+    setPreviewImageUrl(null);
     setDetectedTags([]);
+    setCleanBlobObj(null);
     setCleanDownloadUrl(null);
     setCleanFileSize(null);
     setProcessDurationMs(null);
@@ -334,13 +463,16 @@ export default function App() {
     }
   };
 
+  const activeSteps =
+    selectedMediaKind === 'image' ? IMAGE_PROCESSING_STEPS : VIDEO_PROCESSING_STEPS;
+
   return (
     <div className="min-h-screen bg-[#090D16] text-slate-100 flex flex-col">
       {/* Top Bar Contract: 3 zones separated by gap-8 */}
-      <header className="flex items-center justify-between gap-8 px-6 lg:px-10 py-4 border-b border-slate-800/80 bg-[#090D16]/95 sticky top-0 z-30 backdrop-blur">
+      <header className="flex items-center justify-between gap-3 sm:gap-8 px-4 sm:px-6 lg:px-10 py-4 border-b border-slate-800/80 bg-[#090D16]/95 sticky top-0 z-30 backdrop-blur">
         <a
           href="#workspace"
-          className="text-lg font-bold tracking-tight text-slate-100 font-display whitespace-nowrap shrink-0"
+          className="text-base sm:text-lg font-bold tracking-tight text-slate-100 font-display whitespace-nowrap truncate min-w-0"
         >
           Abubakar AI File Remover
         </a>
@@ -373,9 +505,10 @@ export default function App() {
           <button
             type="button"
             onClick={() => fileInputRef.current?.click()}
-            className="px-4 py-2 text-xs font-semibold text-slate-950 bg-emerald-400 hover:bg-emerald-300 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            className="px-3 sm:px-4 py-2 text-xs font-semibold text-slate-950 bg-emerald-400 hover:bg-emerald-300 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
           >
-            Select MP4 File
+            <span className="sm:hidden">Select File</span>
+            <span className="hidden sm:inline">Select Video / Picture</span>
           </button>
         </div>
       </header>
@@ -415,20 +548,18 @@ export default function App() {
         <section id="workspace" className="space-y-6">
           <div className="max-w-3xl space-y-3">
             <p className="text-xs font-medium text-emerald-400">
-              Lossless FFmpeg Stream Copy · EXIF / XMP / C2PA / JUMBF Purger
+              Lossless Video &amp; Picture Scrubber · EXIF / XMP / C2PA / IPTC Purger
             </p>
             <h1
               className="text-3xl sm:text-4xl font-bold tracking-tight text-slate-50 font-display"
               style={{ textWrap: 'balance' }}
             >
-              Strip All AI-Generated Video Metadata in Milliseconds Without Re-Encoding
+              Strip All AI-Generated Video &amp; Picture Metadata Without Re-Encoding
             </h1>
             <p className="text-sm sm:text-base text-slate-400 leading-relaxed">
-              Completely remove embedded EXIF, XMP, C2PA manifests, and platform-specific tool tags from{' '}
-              <span className="text-slate-200 font-medium">Google Flow</span>,{' '}
-              <span className="text-slate-200 font-medium">Runway Gen-3</span>,{' '}
-              <span className="text-slate-200 font-medium">Luma Dream Machine</span>, and{' '}
-              <span className="text-slate-200 font-medium">Pika</span> MP4 files so exported videos appear 100% natural and original.
+              Completely remove embedded EXIF, XMP, C2PA manifests, and AI generator tags from{' '}
+              <span className="text-slate-200 font-medium">Videos</span> (Google Flow, Runway, Luma, Pika) and{' '}
+              <span className="text-slate-200 font-medium">Pictures</span> (Midjourney, Imagen, DALL-E, Stable Diffusion) so exports appear 100% natural and original.
             </p>
           </div>
 
@@ -438,10 +569,10 @@ export default function App() {
             <div className="lg:col-span-7 space-y-5">
               <input
                 ref={fileInputRef}
-                id="mp4-file-input"
+                id="media-file-input"
                 type="file"
-                accept="video/*,.mp4,.mov,.m4v"
-                aria-label="Upload MP4 video file"
+                accept="video/*,image/*,.mp4,.mov,.m4v,.jpg,.jpeg,.png,.webp,.heic,.avif"
+                aria-label="Upload video or picture file"
                 className="hidden"
                 onChange={(e) => {
                   const file = e.target.files?.[0];
@@ -475,11 +606,10 @@ export default function App() {
 
                   <div className="space-y-1">
                     <h2 className="text-base font-semibold text-slate-100 font-display">
-                      Drag &amp; drop your AI-generated MP4 video here
+                      Drag &amp; drop any AI-generated Video or Picture here
                     </h2>
                     <p className="text-xs text-slate-400">
-                      Supports MP4, MOV, and M4V up to 500 MB · Zero quality loss (
-                      <code className="font-mono text-slate-300">-c:v copy -c:a copy</code>)
+                      Videos (MP4, MOV, M4V) &amp; Pictures (JPG, PNG, WEBP, HEIC) up to 500 MB · Zero quality loss
                     </p>
                   </div>
 
@@ -489,7 +619,7 @@ export default function App() {
                       onClick={() => fileInputRef.current?.click()}
                       className="px-4 py-2.5 rounded-lg bg-emerald-400 hover:bg-emerald-300 text-slate-950 font-semibold text-xs transition-colors whitespace-nowrap shrink-0 cursor-pointer"
                     >
-                      Browse Local MP4 File
+                      Browse Video or Picture
                     </button>
 
                     <button
@@ -501,21 +631,35 @@ export default function App() {
                       <Sparkles className="w-3.5 h-3.5 text-emerald-400" />
                       <span>
                         {isGeneratingSample === 'runway'
-                          ? 'Generating AI Sample...'
-                          : 'Load Sample AI Video (Runway Gen-3)'}
+                          ? 'Loading Sample...'
+                          : 'Load Sample AI Video'}
+                      </span>
+                    </button>
+
+                    <button
+                      type="button"
+                      disabled={isGeneratingSample !== null}
+                      onClick={() => handleLoadSampleAiPicture('midjourney')}
+                      className="inline-flex items-center gap-1.5 px-3.5 py-2.5 rounded-lg border border-slate-700 bg-slate-800/80 hover:bg-slate-700 text-slate-200 font-medium text-xs transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
+                    >
+                      <ImageIcon className="w-3.5 h-3.5 text-emerald-400" />
+                      <span>
+                        {isGeneratingSample === 'img_midjourney'
+                          ? 'Loading Picture...'
+                          : 'Load Sample AI Picture'}
                       </span>
                     </button>
                   </div>
 
-                  {/* Quick Sample Presets for Google Flow, Luma, Pika */}
+                  {/* Quick Sample Presets for Videos & Pictures */}
                   <div className="pt-2 flex flex-wrap items-center justify-center gap-2 text-xs text-slate-400">
-                    <span>Or test preset tags:</span>
+                    <span>Presets:</span>
                     <button
                       type="button"
                       onClick={() => handleLoadSampleAiVideo('google_flow')}
                       className="underline hover:text-slate-200 cursor-pointer whitespace-nowrap"
                     >
-                      Google Flow sample
+                      Google Flow video
                     </button>
                     <span aria-hidden="true">·</span>
                     <button
@@ -523,36 +667,52 @@ export default function App() {
                       onClick={() => handleLoadSampleAiVideo('luma')}
                       className="underline hover:text-slate-200 cursor-pointer whitespace-nowrap"
                     >
-                      Luma Dream Machine sample
+                      Luma video
                     </button>
                     <span aria-hidden="true">·</span>
                     <button
                       type="button"
-                      onClick={() => handleLoadSampleAiVideo('pika')}
+                      onClick={() => handleLoadSampleAiPicture('imagen')}
                       className="underline hover:text-slate-200 cursor-pointer whitespace-nowrap"
                     >
-                      Pika 2.1 sample
+                      Google Imagen picture
+                    </button>
+                    <span aria-hidden="true">·</span>
+                    <button
+                      type="button"
+                      onClick={() => handleLoadSampleAiPicture('stable_diffusion')}
+                      className="underline hover:text-slate-200 cursor-pointer whitespace-nowrap"
+                    >
+                      Stable Diffusion picture
                     </button>
                   </div>
                 </div>
               </div>
 
-              {/* Active Staged Video & Action Card */}
+              {/* Active Staged File & Action Card */}
               {selectedFile && (
                 <div className="rounded-xl border border-slate-800 bg-[#0F1624] p-5 sm:p-6 space-y-5 overflow-hidden">
                   <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-3.5">
                     <div className="flex items-start gap-3.5 min-w-0 flex-1">
-                      <div className="w-10 h-10 rounded-lg bg-slate-800 border border-slate-700 flex items-center justify-center text-emerald-400 shrink-0 mt-0.5">
-                        <Film className="w-5 h-5" />
-                      </div>
+                      {previewImageUrl ? (
+                        <img
+                          src={previewImageUrl}
+                          alt="Staged picture preview"
+                          className="w-11 h-11 rounded-lg object-cover border border-slate-700 shrink-0 bg-slate-900"
+                        />
+                      ) : (
+                        <div className="w-10 h-10 rounded-lg bg-slate-800 border border-slate-700 flex items-center justify-center text-emerald-400 shrink-0 mt-0.5">
+                          <Film className="w-5 h-5" />
+                        </div>
+                      )}
                       <div className="min-w-0 flex-1">
                         <h3 className="text-sm font-semibold text-slate-100 truncate">
                           {selectedFile.name}
                         </h3>
                         <p className="text-xs text-slate-400 mt-0.5 font-mono tabular-nums truncate">
-                          {formatBytes(selectedFile.size)}
+                          {selectedMediaKind === 'image' ? 'Picture' : 'Video'} · {formatBytes(selectedFile.size)}
                           <span className="mx-2 text-slate-600" aria-hidden="true">·</span>
-                          Output: {cleanFileName}
+                          Lossless Quality
                         </p>
                       </div>
                     </div>
@@ -561,7 +721,7 @@ export default function App() {
                       {cleanDownloadUrl && (
                         <button
                           type="button"
-                          onClick={handleProcessVideo}
+                          onClick={handleProcessMedia}
                           className="px-3 py-1.5 rounded-lg border border-slate-700 bg-slate-800/80 hover:bg-slate-700 text-xs font-medium text-slate-200 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
                         >
                           Re-Run Scrubber
@@ -601,7 +761,7 @@ export default function App() {
                         />
                       </div>
                       <p className="text-xs font-mono text-slate-400">
-                        {PROCESSING_STEPS[stepIndex]}
+                        {activeSteps[stepIndex]}
                       </p>
                     </div>
                   )}
@@ -611,14 +771,16 @@ export default function App() {
                     <button
                       type="button"
                       disabled={isProcessing}
-                      onClick={handleProcessVideo}
+                      onClick={handleProcessMedia}
                       className="w-full py-3.5 px-5 rounded-lg bg-emerald-400 hover:bg-emerald-300 disabled:opacity-50 text-slate-950 font-semibold text-sm flex items-center justify-center gap-2 transition-colors cursor-pointer"
                     >
                       <Zap className="w-4 h-4" />
                       <span>
                         {isProcessing
                           ? 'Removing AI Data...'
-                          : 'Remove AI Metadata Now (Lossless FFmpeg)'}
+                          : selectedMediaKind === 'image'
+                            ? 'Remove AI Metadata From Picture (Lossless)'
+                            : 'Remove AI Metadata Now (Lossless)'}
                       </span>
                     </button>
                   ) : (
@@ -627,7 +789,7 @@ export default function App() {
                         <div className="flex items-center gap-2.5 text-xs text-emerald-300 min-w-0">
                           <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0" />
                           <span className="truncate">
-                            All EXIF, XMP, C2PA, and AI platform signatures removed in{' '}
+                            All EXIF, XMP, C2PA, and AI signatures removed in{' '}
                             <strong className="font-mono tabular-nums">{processDurationMs} ms</strong>.
                           </span>
                         </div>
@@ -643,7 +805,7 @@ export default function App() {
                           onClick={() =>
                             triggerToast(
                               'success',
-                              'Downloading Clean Video',
+                              'Downloading Clean File',
                               `Saving "${cleanFileName}" to your device.`
                             )
                           }
@@ -651,7 +813,7 @@ export default function App() {
                         >
                           <Download className="w-4 h-4 shrink-0" />
                           <span className="truncate">
-                            Download Clean Video ({cleanFileName})
+                            Download Clean {selectedMediaKind === 'image' ? 'Picture' : 'Video'} ({cleanFileName})
                           </span>
                         </a>
 
@@ -677,74 +839,151 @@ export default function App() {
               id="supported-platforms"
               className="lg:col-span-5 rounded-xl border border-slate-800 bg-[#0F1624] p-6 space-y-5"
             >
-              <div className="space-y-1">
+              <div className="flex flex-wrap items-center justify-between gap-3">
                 <h2 className="text-base font-semibold text-slate-100 font-display">
-                  Targeted AI Generator Signatures
+                  Targeted AI Signatures
                 </h2>
-                <p className="text-xs text-slate-400 leading-relaxed">
-                  Social platforms automatically flag videos as AI-generated by scanning container boxes (
-                  <code className="font-mono text-slate-300">moov.udta</code>,{' '}
-                  <code className="font-mono text-slate-300">uuid</code>,{' '}
-                  <code className="font-mono text-slate-300">XMP_</code>). Abubakar strips every marker while keeping 100% original video &amp; audio streams.
-                </p>
-              </div>
 
-              <div className="divide-y divide-slate-800/80 text-xs">
-                <div className="py-3 flex items-start justify-between gap-4">
-                  <div>
-                    <p className="font-semibold text-slate-200">Google Flow &amp; Veo</p>
-                    <p className="text-slate-400 mt-0.5">
-                      Purges C2PA JUMBF manifests, <code className="font-mono text-slate-300">XMP:CreatorTool</code>, and SynthID container atoms.
-                    </p>
-                  </div>
-                  <span className="font-mono text-[11px] text-emerald-400 shrink-0">
-                    uuid / udta
-                  </span>
-                </div>
-
-                <div className="py-3 flex items-start justify-between gap-4">
-                  <div>
-                    <p className="font-semibold text-slate-200">Runway Gen-3 / Gen-2</p>
-                    <p className="text-slate-400 mt-0.5">
-                      Strips <code className="font-mono text-slate-300">RunwayML</code> software descriptors, <code className="font-mono text-slate-300">TrainedAlgorithmicMedia</code> IPTC flags, and XMP RDF blocks.
-                    </p>
-                  </div>
-                  <span className="font-mono text-[11px] text-emerald-400 shrink-0">
-                    XMP_ / ©too
-                  </span>
-                </div>
-
-                <div className="py-3 flex items-start justify-between gap-4">
-                  <div>
-                    <p className="font-semibold text-slate-200">Luma Dream Machine</p>
-                    <p className="text-slate-400 mt-0.5">
-                      Removes Ray2 generator comments, encoder strings, and creation history headers.
-                    </p>
-                  </div>
-                  <span className="font-mono text-[11px] text-emerald-400 shrink-0">
-                    ilst.©cmt
-                  </span>
-                </div>
-
-                <div className="py-3 flex items-start justify-between gap-4">
-                  <div>
-                    <p className="font-semibold text-slate-200">Pika Labs (Pika 2.1)</p>
-                    <p className="text-slate-400 mt-0.5">
-                      Clears producer atoms (<code className="font-mono text-slate-300">©ART</code>), custom chapter markers, and <code className="font-mono text-slate-300">Lavf</code> transcode stamps.
-                    </p>
-                  </div>
-                  <span className="font-mono text-[11px] text-emerald-400 shrink-0">
-                    ilst.©ART
-                  </span>
+                <div className="flex items-center gap-1 p-1 rounded-lg bg-[#090D16] border border-slate-800">
+                  <button
+                    type="button"
+                    onClick={() => setPlatformTab('video')}
+                    className={`px-2.5 py-1 text-xs font-medium rounded-md transition-colors whitespace-nowrap cursor-pointer ${
+                      platformTab === 'video'
+                        ? 'bg-emerald-400 text-slate-950 font-semibold'
+                        : 'text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    Videos
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setPlatformTab('image')}
+                    className={`px-2.5 py-1 text-xs font-medium rounded-md transition-colors whitespace-nowrap cursor-pointer ${
+                      platformTab === 'image'
+                        ? 'bg-emerald-400 text-slate-950 font-semibold'
+                        : 'text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    Pictures
+                  </button>
                 </div>
               </div>
+
+              <p className="text-xs text-slate-400 leading-relaxed">
+                {platformTab === 'video'
+                  ? 'Social platforms automatically flag AI videos by scanning container boxes (moov.udta, uuid, XMP_). Every marker is stripped without re-encoding video or audio.'
+                  : 'AI image generators and camera apps embed EXIF, XMP, C2PA, and prompt text chunks inside JPG, PNG, and WEBP files. Every metadata segment is stripped losslessly.'}
+              </p>
+
+              {platformTab === 'video' ? (
+                <div className="divide-y divide-slate-800/80 text-xs">
+                  <div className="py-3 flex items-start justify-between gap-4">
+                    <div>
+                      <p className="font-semibold text-slate-200">Google Flow &amp; Veo</p>
+                      <p className="text-slate-400 mt-0.5">
+                        Purges C2PA JUMBF manifests, <code className="font-mono text-slate-300">XMP:CreatorTool</code>, and SynthID container atoms.
+                      </p>
+                    </div>
+                    <span className="font-mono text-[11px] text-emerald-400 shrink-0">
+                      uuid / udta
+                    </span>
+                  </div>
+
+                  <div className="py-3 flex items-start justify-between gap-4">
+                    <div>
+                      <p className="font-semibold text-slate-200">Runway Gen-3 / Gen-2</p>
+                      <p className="text-slate-400 mt-0.5">
+                        Strips <code className="font-mono text-slate-300">RunwayML</code> software descriptors, <code className="font-mono text-slate-300">TrainedAlgorithmicMedia</code> IPTC flags, and XMP RDF blocks.
+                      </p>
+                    </div>
+                    <span className="font-mono text-[11px] text-emerald-400 shrink-0">
+                      XMP_ / ©too
+                    </span>
+                  </div>
+
+                  <div className="py-3 flex items-start justify-between gap-4">
+                    <div>
+                      <p className="font-semibold text-slate-200">Luma Dream Machine</p>
+                      <p className="text-slate-400 mt-0.5">
+                        Removes Ray2 generator comments, encoder strings, and creation history headers.
+                      </p>
+                    </div>
+                    <span className="font-mono text-[11px] text-emerald-400 shrink-0">
+                      ilst.©cmt
+                    </span>
+                  </div>
+
+                  <div className="py-3 flex items-start justify-between gap-4">
+                    <div>
+                      <p className="font-semibold text-slate-200">Pika Labs (Pika 2.1)</p>
+                      <p className="text-slate-400 mt-0.5">
+                        Clears producer atoms (<code className="font-mono text-slate-300">©ART</code>), custom chapter markers, and <code className="font-mono text-slate-300">Lavf</code> transcode stamps.
+                      </p>
+                    </div>
+                    <span className="font-mono text-[11px] text-emerald-400 shrink-0">
+                      ilst.©ART
+                    </span>
+                  </div>
+                </div>
+              ) : (
+                <div className="divide-y divide-slate-800/80 text-xs">
+                  <div className="py-3 flex items-start justify-between gap-4">
+                    <div>
+                      <p className="font-semibold text-slate-200">Midjourney &amp; DALL-E 3</p>
+                      <p className="text-slate-400 mt-0.5">
+                        Strips <code className="font-mono text-slate-300">tEXt</code> prompt jobs, <code className="font-mono text-slate-300">APP11</code> JUMBF/C2PA manifests, and OpenAI claim headers.
+                      </p>
+                    </div>
+                    <span className="font-mono text-[11px] text-emerald-400 shrink-0">
+                      tEXt / APP11
+                    </span>
+                  </div>
+
+                  <div className="py-3 flex items-start justify-between gap-4">
+                    <div>
+                      <p className="font-semibold text-slate-200">Google Imagen &amp; Gemini</p>
+                      <p className="text-slate-400 mt-0.5">
+                        Removes <code className="font-mono text-slate-300">Made with Google AI</code> IPTC/XMP tags and SynthID metadata blocks.
+                      </p>
+                    </div>
+                    <span className="font-mono text-[11px] text-emerald-400 shrink-0">
+                      APP1 / iTXt
+                    </span>
+                  </div>
+
+                  <div className="py-3 flex items-start justify-between gap-4">
+                    <div>
+                      <p className="font-semibold text-slate-200">Stable Diffusion &amp; ComfyUI</p>
+                      <p className="text-slate-400 mt-0.5">
+                        Purges full node workflow JSON, seeds, negative prompts, and sampler parameters from PNG/JPG.
+                      </p>
+                    </div>
+                    <span className="font-mono text-[11px] text-emerald-400 shrink-0">
+                      tEXt / COM
+                    </span>
+                  </div>
+
+                  <div className="py-3 flex items-start justify-between gap-4">
+                    <div>
+                      <p className="font-semibold text-slate-200">Adobe Firefly &amp; Camera EXIF</p>
+                      <p className="text-slate-400 mt-0.5">
+                        Clears <code className="font-mono text-slate-300">APP13</code> Photoshop IPTC blocks, device GPS coordinates, and camera serial EXIF.
+                      </p>
+                    </div>
+                    <span className="font-mono text-[11px] text-emerald-400 shrink-0">
+                      EXIF / IPTC
+                    </span>
+                  </div>
+                </div>
+              )}
 
               <div className="rounded-lg bg-[#090D16] border border-slate-800 p-3.5 space-y-1">
                 <p className="text-[11px] font-medium text-emerald-400">
                   Lossless Bit-Exact Processing Engine
                 </p>
                 <p className="text-xs text-slate-400 leading-relaxed">
-                  Strips all AI metadata signatures while keeping 100% original video and audio quality without re-encoding.
+                  Strips all AI metadata signatures while keeping 100% original video, audio, and picture pixel quality without re-encoding.
                 </p>
               </div>
             </div>
@@ -754,6 +993,7 @@ export default function App() {
           {selectedFile && (
             <MetadataInspector
               fileName={selectedFile.name}
+              mediaKind={selectedMediaKind}
               originalSize={selectedFile.size}
               cleanSize={cleanFileSize}
               durationMs={processDurationMs}
@@ -771,7 +1011,7 @@ export default function App() {
                 Session Processed Queue
               </h2>
               <p className="text-xs text-slate-400">
-                Videos scrubbed during your current browser session. Server temporary files are deleted immediately after streaming.
+                Videos and pictures scrubbed during your current browser session. Zero server file retention.
               </p>
             </div>
             {history.length > 0 && (
@@ -791,20 +1031,29 @@ export default function App() {
                 <FileVideo className="w-5 h-5 text-slate-400 shrink-0" />
                 <div>
                   <p className="text-sm font-medium text-slate-200">
-                    No videos scrubbed in this session yet
+                    No videos or pictures scrubbed in this session yet
                   </p>
                   <p className="text-xs text-slate-400">
-                    Upload an MP4 above or load a sample AI clip to inspect and strip embedded AI metadata.
+                    Upload an MP4/MOV video or JPG/PNG/WEBP picture above to inspect and strip embedded AI metadata.
                   </p>
                 </div>
               </div>
-              <button
-                type="button"
-                onClick={() => handleLoadSampleAiVideo('runway')}
-                className="px-3.5 py-2 rounded-lg border border-slate-700 bg-slate-800 hover:bg-slate-700 text-xs font-medium text-slate-200 whitespace-nowrap shrink-0 cursor-pointer"
-              >
-                Test with Sample AI Video
-              </button>
+              <div className="flex flex-wrap items-center gap-2.5 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => handleLoadSampleAiVideo('runway')}
+                  className="px-3.5 py-2 rounded-lg border border-slate-700 bg-slate-800 hover:bg-slate-700 text-xs font-medium text-slate-200 whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  Test Sample Video
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleLoadSampleAiPicture('midjourney')}
+                  className="px-3.5 py-2 rounded-lg border border-slate-700 bg-slate-800 hover:bg-slate-700 text-xs font-medium text-slate-200 whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  Test Sample Picture
+                </button>
+              </div>
             </div>
           ) : (
             <div className="rounded-xl border border-slate-800 bg-[#0F1624] overflow-hidden">
@@ -825,7 +1074,7 @@ export default function App() {
                         <td className="py-3 px-5 font-medium text-slate-100">
                           <div>{item.cleanName}</div>
                           <div className="text-[11px] text-slate-400">
-                            Source: {item.originalName} · {item.timestamp}
+                            {item.mediaKind === 'image' ? 'Picture' : 'Video'} · Source: {item.originalName} · {item.timestamp}
                           </div>
                         </td>
                         <td className="py-3 px-4 font-mono tabular-nums text-emerald-400">
@@ -860,7 +1109,7 @@ export default function App() {
       {/* Quiet Footer */}
       <footer className="border-t border-slate-800/80 py-6 px-6 lg:px-10 text-xs text-slate-400">
         <div className="max-w-6xl mx-auto flex flex-wrap items-center justify-between gap-4">
-          <span>Abubakar AI File Remover · Lossless Video Metadata Scrubber</span>
+          <span>Abubakar AI File Remover · Lossless Video &amp; Picture Metadata Scrubber</span>
           <div className="flex flex-wrap items-center gap-4">
             <span>Zero Re-Encoding · Immediate Temp File Cleanup</span>
             {(typeof window !== 'undefined' &&

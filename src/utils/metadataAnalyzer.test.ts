@@ -2,21 +2,44 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   validateVideoFile,
+  validateMediaFile,
   formatBytes,
   inspectBinaryForAiMetadata,
   buildFfmpegCommandString,
   FFMPEG_LOSSLESS_ARGS,
   stripMp4MetadataInBrowser,
   createBrowserSampleMp4Buffer,
+  stripImageMetadataInBrowser,
+  createBrowserSamplePngBuffer,
+  stripJpegMetadata,
+  stripWebpMetadata,
 } from './metadataAnalyzer';
 
 test('validateVideoFile accepts valid MP4 files and automatically renames to Abubakar Remove AI.mp4', () => {
   const res = validateVideoFile('Runway_Gen3_Scene 01.mp4', 12_500_000, 'video/mp4');
   assert.equal(res.valid, true);
+  assert.equal(res.mediaKind, 'video');
   assert.equal(res.normalizedCleanName, 'Abubakar Remove AI.mp4');
 });
 
-test('validateVideoFile rejects empty or oversized or non-video files', () => {
+test('validateMediaFile accepts pictures (JPG, PNG, WEBP) and automatically renames to Abubakar Remove AI.<ext>', () => {
+  const jpg = validateMediaFile('Midjourney_Portrait.jpeg', 2_400_000, 'image/jpeg');
+  assert.equal(jpg.valid, true);
+  assert.equal(jpg.mediaKind, 'image');
+  assert.equal(jpg.normalizedCleanName, 'Abubakar Remove AI.jpg');
+
+  const png = validateMediaFile('ComfyUI_Render.png', 4_100_000, 'image/png');
+  assert.equal(png.valid, true);
+  assert.equal(png.mediaKind, 'image');
+  assert.equal(png.normalizedCleanName, 'Abubakar Remove AI.png');
+
+  const webp = validateMediaFile('Imagen_Shot.webp', 900_000, 'image/webp');
+  assert.equal(webp.valid, true);
+  assert.equal(webp.mediaKind, 'image');
+  assert.equal(webp.normalizedCleanName, 'Abubakar Remove AI.webp');
+});
+
+test('validateVideoFile rejects empty or oversized or non-media files', () => {
   const emptyRes = validateVideoFile('clip.mp4', 0, 'video/mp4');
   assert.equal(emptyRes.valid, false);
   assert.match(emptyRes.error || '', /empty/i);
@@ -112,7 +135,6 @@ test('stripMp4MetadataInBrowser parses real MP4 box tree, converts udta/uuid to 
   );
   assert.equal(/Runway|Google Flow|Luma|Pika|c2pa/i.test(beforeMdatText), false);
 
-  // Verify mdat payload is 100% bit-exact untouched
   const mdatSlice = scrubbed.subarray(
     mp4.byteLength - mdatPayload.byteLength,
     mp4.byteLength
@@ -120,4 +142,104 @@ test('stripMp4MetadataInBrowser parses real MP4 box tree, converts udta/uuid to 
   assert.equal(dec.decode(mdatSlice), 'RAW_VIDEO_FRAME_BYTES_Runway_SHOULD_NOT_BE_TOUCHED');
 });
 
+test('stripImageMetadataInBrowser strips Midjourney, XMP, and eXIf chunks from PNG while keeping IHDR/IDAT/IEND intact', () => {
+  const samplePng = createBrowserSamplePngBuffer('midjourney');
+  const detected = inspectBinaryForAiMetadata(samplePng, 'mj.png', 'image');
+  assert.ok(detected.some((d) => d.platform === 'Midjourney'));
+  assert.ok(detected.some((d) => d.platform === 'C2PA / EXIF'));
 
+  const cleanPng = stripImageMetadataInBrowser(samplePng);
+  const dec = new TextDecoder('latin1');
+  const text = dec.decode(cleanPng);
+
+  assert.equal(cleanPng[0], 0x89);
+  assert.equal(cleanPng[1], 0x50);
+  assert.ok(text.includes('IHDR'));
+  assert.ok(text.includes('IDAT'));
+  assert.ok(text.includes('IEND'));
+  assert.equal(/Midjourney|c2pa|TrainedAlgorithmicMedia|eXIf|tEXt|iTXt/i.test(text), false);
+});
+
+test('stripJpegMetadata removes APP1 EXIF/XMP, APP11 C2PA, and COM prompt segments while keeping APP0 and SOS scan data', () => {
+  const enc = new TextEncoder();
+  const makeSeg = (marker: number, payload: Uint8Array) => {
+    const len = 2 + payload.byteLength;
+    const out = new Uint8Array(2 + len);
+    out[0] = 0xff;
+    out[1] = marker;
+    out[2] = (len >>> 8) & 0xff;
+    out[3] = len & 0xff;
+    out.set(payload, 4);
+    return out;
+  };
+
+  const soi = new Uint8Array([0xff, 0xd8]);
+  const app0 = makeSeg(0xe0, enc.encode('JFIF\0\x01\x01\0\0\x01\0\x01\0\0'));
+  const app1 = makeSeg(0xe1, enc.encode('Exif\0\0Midjourney Google AI Imagen XMP'));
+  const app11 = makeSeg(0xeb, enc.encode('c2pa.jumbf TrainedAlgorithmicMedia'));
+  const com = makeSeg(0xfe, enc.encode('Stable Diffusion Steps: 30, Sampler: Euler'));
+  const sosHeader = makeSeg(0xda, new Uint8Array([0x03, 0x01, 0x00]));
+  const scanData = new Uint8Array([0x11, 0x22, 0x33, 0xff, 0xd9]);
+
+  const parts = [soi, app0, app1, app11, com, sosHeader, scanData];
+  const total = parts.reduce((a, b) => a + b.byteLength, 0);
+  const jpeg = new Uint8Array(total);
+  let p = 0;
+  for (const part of parts) {
+    jpeg.set(part, p);
+    p += part.byteLength;
+  }
+
+  const cleanJpeg = stripJpegMetadata(jpeg);
+  const dec = new TextDecoder('latin1');
+  const cleanText = dec.decode(cleanJpeg);
+
+  assert.equal(cleanJpeg[0], 0xff);
+  assert.equal(cleanJpeg[1], 0xd8);
+  assert.ok(cleanText.includes('JFIF'));
+  assert.equal(/Midjourney|Imagen|c2pa|Stable Diffusion/i.test(cleanText), false);
+  // Scan data & EOI preserved
+  assert.equal(cleanJpeg[cleanJpeg.byteLength - 2], 0xff);
+  assert.equal(cleanJpeg[cleanJpeg.byteLength - 1], 0xd9);
+});
+
+test('stripWebpMetadata removes EXIF, XMP, and C2PA chunks from RIFF WEBP while updating RIFF size', () => {
+  const enc = new TextEncoder();
+  const makeChunk = (fourCC: string, data: Uint8Array) => {
+    const padded = data.byteLength + (data.byteLength % 2);
+    const out = new Uint8Array(8 + padded);
+    for (let i = 0; i < 4; i++) out[i] = fourCC.charCodeAt(i);
+    out[4] = data.byteLength & 0xff;
+    out[5] = (data.byteLength >>> 8) & 0xff;
+    out[6] = (data.byteLength >>> 16) & 0xff;
+    out[7] = (data.byteLength >>> 24) & 0xff;
+    out.set(data, 8);
+    return out;
+  };
+
+  const vp8 = makeChunk('VP8 ', new Uint8Array([0xaa, 0xbb, 0xcc, 0xdd]));
+  const exif = makeChunk('EXIF', enc.encode('DALL-E 3 OpenAI'));
+  const xmp = makeChunk('XMP ', enc.encode('c2pa.jumbf Google Imagen'));
+
+  const bodySize = 4 + vp8.byteLength + exif.byteLength + xmp.byteLength;
+  const webp = new Uint8Array(8 + bodySize);
+  webp.set(enc.encode('RIFF'), 0);
+  webp[4] = bodySize & 0xff;
+  webp[5] = (bodySize >>> 8) & 0xff;
+  webp[6] = (bodySize >>> 16) & 0xff;
+  webp[7] = (bodySize >>> 24) & 0xff;
+  webp.set(enc.encode('WEBP'), 8);
+  let pos = 12;
+  for (const c of [vp8, exif, xmp]) {
+    webp.set(c, pos);
+    pos += c.byteLength;
+  }
+
+  const cleanWebp = stripWebpMetadata(webp);
+  const dec = new TextDecoder('latin1');
+  const text = dec.decode(cleanWebp);
+  assert.ok(text.startsWith('RIFF'));
+  assert.ok(text.includes('WEBP'));
+  assert.ok(text.includes('VP8 '));
+  assert.equal(/DALL-E|OpenAI|c2pa|Imagen/i.test(text), false);
+});
