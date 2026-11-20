@@ -6,6 +6,11 @@ import os from 'os';
 import path from 'path';
 import crypto from 'crypto';
 import { createServer as createViteServer } from 'vite';
+import {
+  DEFAULT_CAMERA_PROFILE_ID,
+  getCameraProfile,
+  buildFfmpegCameraMetadataArgs,
+} from './src/utils/cameraProfiles';
 
 const PORT = 3000;
 
@@ -148,6 +153,12 @@ async function startServer() {
     const outputPath = path.join(os.tmpdir(), `abubakar_clean_${outputId}.mp4`);
 
     const downloadFileName = 'Abubakar Remove AI.mp4';
+    const requestedProfileId =
+      typeof req.body?.cameraProfile === 'string'
+        ? req.body.cameraProfile
+        : DEFAULT_CAMERA_PROFILE_ID;
+    const cameraProfile = getCameraProfile(requestedProfileId);
+    const cameraFfmpegArgs = buildFfmpegCameraMetadataArgs(cameraProfile);
 
     try {
       await new Promise<void>((resolve, reject) => {
@@ -161,14 +172,7 @@ async function startServer() {
             'copy',
             '-c:a',
             'copy',
-            '-fflags',
-            '+bitexact',
-            '-flags:v',
-            '+bitexact',
-            '-flags:a',
-            '+bitexact',
-            '-movflags',
-            '+faststart',
+            ...cameraFfmpegArgs,
           ])
           .output(outputPath)
           .on('end', () => resolve())
@@ -196,21 +200,25 @@ async function startServer() {
       res.setHeader('X-Clean-Size', String(outStat.size));
       res.setHeader('X-Process-Duration-Ms', String(durationMs));
       res.setHeader('X-Clean-Filename', downloadFileName);
+      res.setHeader('X-Camera-Profile', cameraProfile.id);
       res.setHeader(
         'Access-Control-Expose-Headers',
-        'X-Original-Size, X-Clean-Size, X-Process-Duration-Ms, X-Clean-Filename'
+        'X-Original-Size, X-Clean-Size, X-Process-Duration-Ms, X-Clean-Filename, X-Camera-Profile'
       );
 
       res.status(200).send(cleanBuffer);
     } catch (error: unknown) {
       // Fallback: if FFmpeg stream copy encounters a non-standard QuickTime data track,
-      // perform lossless ISO MP4/MOV atom scrubbing directly on the binary buffer so the user never gets an error
+      // perform lossless ISO MP4/MOV atom scrubbing + camera profile injection directly on the binary buffer
       try {
         const rawBuf = await fs.promises.readFile(inputPath);
         const { stripMp4MetadataInBrowser } = await import(
           './src/utils/metadataAnalyzer.ts'
         );
-        const scrubbedArr = stripMp4MetadataInBrowser(new Uint8Array(rawBuf));
+        const scrubbedArr = stripMp4MetadataInBrowser(
+          new Uint8Array(rawBuf),
+          cameraProfile
+        );
         const cleanBuffer = Buffer.from(scrubbedArr);
         const durationMs = Math.max(1, Date.now() - startTime);
 
@@ -225,9 +233,10 @@ async function startServer() {
         res.setHeader('X-Clean-Size', String(cleanBuffer.byteLength));
         res.setHeader('X-Process-Duration-Ms', String(durationMs));
         res.setHeader('X-Clean-Filename', downloadFileName);
+        res.setHeader('X-Camera-Profile', cameraProfile.id);
         res.setHeader(
           'Access-Control-Expose-Headers',
-          'X-Original-Size, X-Clean-Size, X-Process-Duration-Ms, X-Clean-Filename'
+          'X-Original-Size, X-Clean-Size, X-Process-Duration-Ms, X-Clean-Filename, X-Camera-Profile'
         );
         res.status(200).send(cleanBuffer);
       } catch (fallbackErr: unknown) {

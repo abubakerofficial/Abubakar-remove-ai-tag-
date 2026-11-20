@@ -31,12 +31,19 @@ import {
   createBrowserSamplePngBuffer,
 } from './utils/metadataAnalyzer';
 import { MetadataInspector } from './components/MetadataInspector';
+import { CameraProfileSelector } from './components/CameraProfileSelector';
+import {
+  CameraProfileId,
+  DEFAULT_CAMERA_PROFILE_ID,
+  getCameraProfile,
+} from './utils/cameraProfiles';
 
 interface ProcessedHistoryItem {
   id: string;
   mediaKind: MediaKind;
   originalName: string;
   cleanName: string;
+  cameraProfileLabel: string;
   originalSize: number;
   cleanSize: number;
   durationMs: number;
@@ -54,16 +61,16 @@ interface ToastNotification {
 
 const VIDEO_PROCESSING_STEPS = [
   'Parsing MP4 container atoms (moov.udta, XMP_, C2PA JUMBF)...',
-  'Running lossless stream scrubber without re-encoding...',
-  'Stripping Google Flow, Runway, Luma & Pika generator signatures...',
-  'Verifying bit-exact clean video output & purging temporary data...',
+  'Stripping Google Flow, Runway, Luma & Pika AI signatures...',
+  'Injecting genuine DSLR / Mobile Camera hardware metadata tags...',
+  'Verifying bit-exact camera output & purging temporary data...',
 ];
 
 const IMAGE_PROCESSING_STEPS = [
   'Scanning picture segments (APP1 EXIF, XMP, PNG tEXt/iTXt, C2PA)...',
   'Stripping Midjourney, Imagen, DALL-E & Stable Diffusion tags...',
-  'Removing camera GPS, device timestamps & IPTC identifiers...',
-  'Finalizing 100% clean picture with untouched pixel quality...',
+  'Injecting genuine DSLR / Mobile Camera EXIF Make, Model & Lens...',
+  'Finalizing 100% original-quality camera picture output...',
 ];
 
 async function reencodeImageViaCanvas(
@@ -109,6 +116,9 @@ export default function App() {
   const [isDragging, setIsDragging] = useState(false);
   const [isGeneratingSample, setIsGeneratingSample] = useState<string | null>(null);
   const [platformTab, setPlatformTab] = useState<'video' | 'image'>('video');
+  const [cameraProfileId, setCameraProfileId] = useState<CameraProfileId>(
+    DEFAULT_CAMERA_PROFILE_ID
+  );
 
   const [isProcessing, setIsProcessing] = useState(false);
   const [progress, setProgress] = useState(0);
@@ -325,6 +335,8 @@ export default function App() {
       let serverDuration = 0;
       const outName = cleanFileName || 'Abubakar Remove AI.mp4';
 
+      const activeCameraProfile = getCameraProfile(cameraProfileId);
+
       if (selectedMediaKind === 'image') {
         await new Promise((r) => setTimeout(r, 200));
         const rawBytes = new Uint8Array(await selectedFile.arrayBuffer());
@@ -334,12 +346,13 @@ export default function App() {
           (rawBytes[0] === 0x52 && rawBytes[1] === 0x49); // RIFF WEBP
 
         if (isNativeBinaryImage) {
-          cleanBuffer = stripImageMetadataInBrowser(rawBytes);
+          cleanBuffer = stripImageMetadataInBrowser(rawBytes, activeCameraProfile);
         } else {
-          cleanBuffer = await reencodeImageViaCanvas(
+          const canvasBytes = await reencodeImageViaCanvas(
             selectedFile,
             outputMimeType || 'image/png'
           );
+          cleanBuffer = stripImageMetadataInBrowser(canvasBytes, activeCameraProfile);
         }
 
         cleanBlob = new Blob([cleanBuffer as unknown as BlobPart], {
@@ -356,6 +369,7 @@ export default function App() {
           try {
             const formData = new FormData();
             formData.append('video', selectedFile);
+            formData.append('cameraProfile', activeCameraProfile.id);
 
             const response = await fetch('/api/strip-metadata', {
               method: 'POST',
@@ -375,7 +389,7 @@ export default function App() {
             );
           } catch {
             const rawBytes = new Uint8Array(await selectedFile.arrayBuffer());
-            cleanBuffer = stripMp4MetadataInBrowser(rawBytes);
+            cleanBuffer = stripMp4MetadataInBrowser(rawBytes, activeCameraProfile);
             cleanBlob = new Blob([cleanBuffer as unknown as BlobPart], {
               type: 'video/mp4',
             });
@@ -384,7 +398,7 @@ export default function App() {
         } else {
           await new Promise((r) => setTimeout(r, 240));
           const rawBytes = new Uint8Array(await selectedFile.arrayBuffer());
-          cleanBuffer = stripMp4MetadataInBrowser(rawBytes);
+          cleanBuffer = stripMp4MetadataInBrowser(rawBytes, activeCameraProfile);
           cleanBlob = new Blob([cleanBuffer as unknown as BlobPart], {
             type: 'video/mp4',
           });
@@ -412,6 +426,7 @@ export default function App() {
         mediaKind: selectedMediaKind,
         originalName: selectedFile.name,
         cleanName: outName,
+        cameraProfileLabel: activeCameraProfile.shortLabel,
         originalSize: selectedFile.size,
         cleanSize: cleanBuffer.byteLength,
         durationMs: serverDuration,
@@ -426,10 +441,15 @@ export default function App() {
 
       setHistory((prev) => [historyEntry, ...prev.slice(0, 7)]);
 
+      const cameraNote =
+        activeCameraProfile.id !== 'none'
+          ? ` Injected ${activeCameraProfile.label} hardware metadata.`
+          : '';
+
       triggerToast(
         'success',
-        'AI Metadata Completely Removed',
-        `Stripped ${detectedTags.length} metadata signatures in ${serverDuration} ms. Ready to download as "${outName}".`
+        'AI Metadata Removed & Camera Ready',
+        `Stripped ${detectedTags.length} AI tags in ${serverDuration} ms.${cameraNote} Ready to download as "${outName}".`
       );
     } catch (error: unknown) {
       clearInterval(progressTimer);
@@ -463,8 +483,20 @@ export default function App() {
     }
   };
 
+  const activeCameraProfile = getCameraProfile(cameraProfileId);
   const activeSteps =
     selectedMediaKind === 'image' ? IMAGE_PROCESSING_STEPS : VIDEO_PROCESSING_STEPS;
+
+  const handleSelectCameraProfile = (id: CameraProfileId) => {
+    setCameraProfileId(id);
+    if (cleanDownloadUrl) {
+      URL.revokeObjectURL(cleanDownloadUrl);
+      setCleanDownloadUrl(null);
+      setCleanBlobObj(null);
+      setCleanFileSize(null);
+      setProcessDurationMs(null);
+    }
+  };
 
   return (
     <div className="min-h-screen bg-[#090D16] text-slate-100 flex flex-col">
@@ -548,18 +580,19 @@ export default function App() {
         <section id="workspace" className="space-y-6">
           <div className="max-w-3xl space-y-3">
             <p className="text-xs font-medium text-emerald-400">
-              Lossless Video &amp; Picture Scrubber · EXIF / XMP / C2PA / IPTC Purger
+              Lossless Video &amp; Picture Scrubber · Auto DSLR &amp; Mobile Camera Signature
             </p>
             <h1
               className="text-3xl sm:text-4xl font-bold tracking-tight text-slate-50 font-display"
               style={{ textWrap: 'balance' }}
             >
-              Strip All AI-Generated Video &amp; Picture Metadata Without Re-Encoding
+              Strip All AI Metadata &amp; Inject Real DSLR or Mobile Camera Tags
             </h1>
             <p className="text-sm sm:text-base text-slate-400 leading-relaxed">
-              Completely remove embedded EXIF, XMP, C2PA manifests, and AI generator tags from{' '}
+              Automatically removes EXIF, XMP, C2PA, and AI generator tags from{' '}
               <span className="text-slate-200 font-medium">Videos</span> (Google Flow, Runway, Luma, Pika) and{' '}
-              <span className="text-slate-200 font-medium">Pictures</span> (Midjourney, Imagen, DALL-E, Stable Diffusion) so exports appear 100% natural and original.
+              <span className="text-slate-200 font-medium">Pictures</span> (Midjourney, Imagen, DALL-E, Stable Diffusion), then embeds authentic{' '}
+              <span className="text-emerald-300 font-medium">DSLR or Mobile Camera</span> hardware metadata so TikTok, YouTube, and Instagram recognize it as real camera footage.
             </p>
           </div>
 
@@ -593,15 +626,15 @@ export default function App() {
                   const dropped = e.dataTransfer.files?.[0];
                   if (dropped) inspectAndStageFile(dropped);
                 }}
-                className={`rounded-xl border border-dashed p-8 transition-colors ${
+                className={`rounded-xl border border-dashed p-6 transition-colors ${
                   isDragging
                     ? 'border-emerald-400 bg-emerald-950/20'
                     : 'border-slate-700/90 bg-[#0F1624] hover:border-slate-600'
                 }`}
               >
-                <div className="flex flex-col items-center text-center space-y-4">
-                  <div className="w-12 h-12 rounded-xl bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center text-emerald-400">
-                    <Upload className="w-6 h-6" />
+                <div className="flex flex-col items-center text-center space-y-3.5">
+                  <div className="w-11 h-11 rounded-xl bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center text-emerald-400">
+                    <Upload className="w-5 h-5" />
                   </div>
 
                   <div className="space-y-1">
@@ -613,11 +646,11 @@ export default function App() {
                     </p>
                   </div>
 
-                  <div className="flex flex-wrap items-center justify-center gap-3 pt-1">
+                  <div className="flex flex-wrap items-center justify-center gap-2.5 pt-1">
                     <button
                       type="button"
                       onClick={() => fileInputRef.current?.click()}
-                      className="px-4 py-2.5 rounded-lg bg-emerald-400 hover:bg-emerald-300 text-slate-950 font-semibold text-xs transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                      className="px-4 py-2 rounded-lg bg-emerald-400 hover:bg-emerald-300 text-slate-950 font-semibold text-xs transition-colors whitespace-nowrap shrink-0 cursor-pointer"
                     >
                       Browse Video or Picture
                     </button>
@@ -626,7 +659,7 @@ export default function App() {
                       type="button"
                       disabled={isGeneratingSample !== null}
                       onClick={() => handleLoadSampleAiVideo('runway')}
-                      className="inline-flex items-center gap-1.5 px-3.5 py-2.5 rounded-lg border border-slate-700 bg-slate-800/80 hover:bg-slate-700 text-slate-200 font-medium text-xs transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
+                      className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg border border-slate-700 bg-slate-800/80 hover:bg-slate-700 text-slate-200 font-medium text-xs transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
                     >
                       <Sparkles className="w-3.5 h-3.5 text-emerald-400" />
                       <span>
@@ -640,7 +673,7 @@ export default function App() {
                       type="button"
                       disabled={isGeneratingSample !== null}
                       onClick={() => handleLoadSampleAiPicture('midjourney')}
-                      className="inline-flex items-center gap-1.5 px-3.5 py-2.5 rounded-lg border border-slate-700 bg-slate-800/80 hover:bg-slate-700 text-slate-200 font-medium text-xs transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
+                      className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg border border-slate-700 bg-slate-800/80 hover:bg-slate-700 text-slate-200 font-medium text-xs transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
                     >
                       <ImageIcon className="w-3.5 h-3.5 text-emerald-400" />
                       <span>
@@ -652,7 +685,7 @@ export default function App() {
                   </div>
 
                   {/* Quick Sample Presets for Videos & Pictures */}
-                  <div className="pt-2 flex flex-wrap items-center justify-center gap-2 text-xs text-slate-400">
+                  <div className="pt-1 flex flex-wrap items-center justify-center gap-2 text-xs text-slate-400">
                     <span>Presets:</span>
                     <button
                       type="button"
@@ -691,7 +724,7 @@ export default function App() {
 
               {/* Active Staged File & Action Card */}
               {selectedFile && (
-                <div className="rounded-xl border border-slate-800 bg-[#0F1624] p-5 sm:p-6 space-y-5 overflow-hidden">
+                <div className="rounded-xl border border-slate-800 bg-[#0F1624] p-5 space-y-4 overflow-hidden">
                   <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-3.5">
                     <div className="flex items-start gap-3.5 min-w-0 flex-1">
                       {previewImageUrl ? (
@@ -712,7 +745,7 @@ export default function App() {
                         <p className="text-xs text-slate-400 mt-0.5 font-mono tabular-nums truncate">
                           {selectedMediaKind === 'image' ? 'Picture' : 'Video'} · {formatBytes(selectedFile.size)}
                           <span className="mx-2 text-slate-600" aria-hidden="true">·</span>
-                          Lossless Quality
+                          {activeCameraProfile.shortLabel}
                         </p>
                       </div>
                     </div>
@@ -777,10 +810,12 @@ export default function App() {
                       <Zap className="w-4 h-4" />
                       <span>
                         {isProcessing
-                          ? 'Removing AI Data...'
-                          : selectedMediaKind === 'image'
-                            ? 'Remove AI Metadata From Picture (Lossless)'
-                            : 'Remove AI Metadata Now (Lossless)'}
+                          ? 'Removing AI Data & Injecting Camera Tag...'
+                          : activeCameraProfile.id !== 'none'
+                            ? `Remove AI & Apply ${activeCameraProfile.shortLabel}`
+                            : selectedMediaKind === 'image'
+                              ? 'Remove AI Metadata From Picture (Lossless)'
+                              : 'Remove AI Metadata Now (Lossless)'}
                       </span>
                     </button>
                   ) : (
@@ -789,8 +824,11 @@ export default function App() {
                         <div className="flex items-center gap-2.5 text-xs text-emerald-300 min-w-0">
                           <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0" />
                           <span className="truncate">
-                            All EXIF, XMP, C2PA, and AI signatures removed in{' '}
-                            <strong className="font-mono tabular-nums">{processDurationMs} ms</strong>.
+                            AI tags removed
+                            {activeCameraProfile.id !== 'none'
+                              ? ` & ${activeCameraProfile.shortLabel} injected`
+                              : ''}{' '}
+                            in <strong className="font-mono tabular-nums">{processDurationMs} ms</strong>.
                           </span>
                         </div>
                         <span className="text-xs font-mono tabular-nums text-emerald-400 shrink-0">
@@ -832,6 +870,13 @@ export default function App() {
                   )}
                 </div>
               )}
+
+              {/* Auto DSLR & Mobile Camera Signature Selector */}
+              <CameraProfileSelector
+                selectedProfileId={cameraProfileId}
+                onSelect={handleSelectCameraProfile}
+                disabled={isProcessing}
+              />
             </div>
 
             {/* Right 5 Columns: Technical Pipeline & Platform Coverage Card */}
@@ -999,6 +1044,7 @@ export default function App() {
               durationMs={processDurationMs}
               detectedTags={detectedTags}
               isCleaned={Boolean(cleanDownloadUrl)}
+              cameraProfile={activeCameraProfile}
             />
           )}
         </section>
@@ -1074,7 +1120,7 @@ export default function App() {
                         <td className="py-3 px-5 font-medium text-slate-100">
                           <div>{item.cleanName}</div>
                           <div className="text-[11px] text-slate-400">
-                            {item.mediaKind === 'image' ? 'Picture' : 'Video'} · Source: {item.originalName} · {item.timestamp}
+                            {item.mediaKind === 'image' ? 'Picture' : 'Video'} · {item.cameraProfileLabel} · {item.timestamp}
                           </div>
                         </td>
                         <td className="py-3 px-4 font-mono tabular-nums text-emerald-400">

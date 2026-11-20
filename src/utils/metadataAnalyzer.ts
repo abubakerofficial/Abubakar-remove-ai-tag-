@@ -1,3 +1,9 @@
+import {
+  CameraProfile,
+  buildExifTiffPayload,
+  buildMp4CameraMetaBox,
+} from './cameraProfiles';
+
 export type MediaKind = 'video' | 'image';
 
 export interface DetectedMetadataTag {
@@ -512,8 +518,14 @@ function walkAndScrubMp4Boxes(
  * Losslessly scrubs MP4/MOV metadata boxes (udta, meta, XMP_, C2PA uuid, ilst) and AI generator
  * signatures directly in the browser ArrayBuffer by converting metadata atoms to MP4 `free`
  * padding boxes and zeroing (0x00) their payloads while skipping `mdat` media frames.
+ * When a DSLR or Mobile Camera profile is provided, injects genuine QuickTime/ISO camera
+ * hardware metadata (`com.apple.quicktime.make/model/software/creationdate/lens_model`)
+ * without shifting any `mdat` chunk offsets (`stco`/`co64`).
  */
-export function stripMp4MetadataInBrowser(input: Uint8Array): Uint8Array {
+export function stripMp4MetadataInBrowser(
+  input: Uint8Array,
+  cameraProfile?: CameraProfile
+): Uint8Array {
   const output = new Uint8Array(input.byteLength);
   output.set(input);
 
@@ -528,14 +540,76 @@ export function stripMp4MetadataInBrowser(input: Uint8Array): Uint8Array {
     }
   }
 
-  return output;
+  if (!cameraProfile || cameraProfile.id === 'none') {
+    return output;
+  }
+
+  const cameraMetaBox = buildMp4CameraMetaBox(cameraProfile);
+  if (cameraMetaBox.byteLength === 0) {
+    return output;
+  }
+
+  // Check if the final top-level box is `moov` (standard 32-bit size header) so we can
+  // safely place `meta` inside `moov` without shifting any `mdat` offsets.
+  let offset = 0;
+  let lastMoovOffset = -1;
+  let lastMoovEnd = -1;
+  let lastMoovIs32Bit = false;
+
+  while (offset + 8 <= output.byteLength) {
+    let boxSize = readUint32BE(output, offset);
+    const boxType = readBoxType(output, offset + 4);
+    if (!/^[\x20-\x7E]{4}$/.test(boxType)) break;
+    let is32Bit = true;
+    if (boxSize === 1) {
+      if (offset + 16 > output.byteLength) break;
+      const high = readUint32BE(output, offset + 8);
+      const low = readUint32BE(output, offset + 12);
+      boxSize = high * 4294967296 + low;
+      is32Bit = false;
+    } else if (boxSize === 0) {
+      boxSize = output.byteLength - offset;
+      is32Bit = false;
+    }
+    if (boxSize < 8 || offset + boxSize > output.byteLength) break;
+    if (boxType === 'moov') {
+      lastMoovOffset = offset;
+      lastMoovEnd = offset + boxSize;
+      lastMoovIs32Bit = is32Bit;
+    }
+    offset += boxSize;
+  }
+
+  const combined = new Uint8Array(output.byteLength + cameraMetaBox.byteLength);
+  combined.set(output, 0);
+  combined.set(cameraMetaBox, output.byteLength);
+
+  if (
+    lastMoovOffset >= 0 &&
+    lastMoovEnd === output.byteLength &&
+    lastMoovIs32Bit
+  ) {
+    // Expand trailing `moov` box size so `meta` is a direct child of `moov`
+    const oldMoovSize = readUint32BE(combined, lastMoovOffset);
+    const newMoovSize = oldMoovSize + cameraMetaBox.byteLength;
+    combined[lastMoovOffset] = (newMoovSize >>> 24) & 0xff;
+    combined[lastMoovOffset + 1] = (newMoovSize >>> 16) & 0xff;
+    combined[lastMoovOffset + 2] = (newMoovSize >>> 8) & 0xff;
+    combined[lastMoovOffset + 3] = newMoovSize & 0xff;
+  }
+
+  return combined;
 }
 
 /**
  * Losslessly strips EXIF (APP1), XMP, C2PA/JUMBF (APP11), IPTC/Photoshop (APP13),
- * Adobe (APP14), and COM comment segments from JPEG binary data without recompression.
+ * Adobe (APP14), and COM comment segments from JPEG binary data without recompression,
+ * and optionally injects a clean DSLR or Mobile Camera APP1 EXIF segment.
  */
-export function stripJpegMetadata(input: Uint8Array): Uint8Array {
+export function stripJpegMetadata(
+  input: Uint8Array,
+  cameraProfile?: CameraProfile
+): Uint8Array {
   if (input.byteLength < 4 || input[0] !== 0xff || input[1] !== 0xd8) {
     return input;
   }
@@ -593,6 +667,33 @@ export function stripJpegMetadata(input: Uint8Array): Uint8Array {
     offset += segLen;
   }
 
+  if (cameraProfile && cameraProfile.id !== 'none') {
+    const tiffPayload = buildExifTiffPayload(cameraProfile);
+    if (tiffPayload.byteLength > 0) {
+      const exifHeader = new Uint8Array([0x45, 0x78, 0x69, 0x66, 0x00, 0x00]); // "Exif\0\0"
+      const segLength = 2 + exifHeader.byteLength + tiffPayload.byteLength;
+      const app1Segment = new Uint8Array(2 + segLength);
+      app1Segment[0] = 0xff;
+      app1Segment[1] = 0xe1; // APP1
+      app1Segment[2] = (segLength >>> 8) & 0xff;
+      app1Segment[3] = segLength & 0xff;
+      app1Segment.set(exifHeader, 4);
+      app1Segment.set(tiffPayload, 10);
+
+      // Insert right after SOI (or after APP0 if keptChunks[1] is 0xFF 0xE0)
+      let insertIdx = 1;
+      if (
+        keptChunks.length >= 3 &&
+        keptChunks[1].byteLength === 2 &&
+        keptChunks[1][0] === 0xff &&
+        keptChunks[1][1] === 0xe0
+      ) {
+        insertIdx = 3;
+      }
+      keptChunks.splice(insertIdx, 0, app1Segment);
+    }
+  }
+
   const totalLen = keptChunks.reduce((acc, c) => acc + c.byteLength, 0);
   const out = new Uint8Array(totalLen);
   let pos = 0;
@@ -606,9 +707,13 @@ export function stripJpegMetadata(input: Uint8Array): Uint8Array {
 /**
  * Losslessly strips PNG metadata chunks (tEXt, zTXt, iTXt, eXIf, caBX, tIME)
  * containing Midjourney, Stable Diffusion, ComfyUI, DALL-E, and C2PA tags while
- * preserving exact pixel data (IHDR, PLTE, IDAT, IEND, tRNS, sRGB, gAMA, cHRM).
+ * preserving exact pixel data (IHDR, PLTE, IDAT, IEND, tRNS, sRGB, gAMA, cHRM),
+ * and optionally injects a clean DSLR / Mobile Camera `eXIf` chunk right after IHDR.
  */
-export function stripPngMetadata(input: Uint8Array): Uint8Array {
+export function stripPngMetadata(
+  input: Uint8Array,
+  cameraProfile?: CameraProfile
+): Uint8Array {
   const PNG_SIG = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
   if (input.byteLength < 8) return input;
   for (let i = 0; i < 8; i++) {
@@ -627,6 +732,7 @@ export function stripPngMetadata(input: Uint8Array): Uint8Array {
 
   const keptChunks: Uint8Array[] = [input.subarray(0, 8)];
   let offset = 8;
+  let injectedExif = false;
 
   while (offset + 12 <= input.byteLength) {
     const dataLen = readUint32BE(input, offset);
@@ -639,6 +745,18 @@ export function stripPngMetadata(input: Uint8Array): Uint8Array {
 
     if (!METADATA_CHUNKS.has(chunkType)) {
       keptChunks.push(input.subarray(offset, offset + totalChunkLen));
+      if (
+        chunkType === 'IHDR' &&
+        !injectedExif &&
+        cameraProfile &&
+        cameraProfile.id !== 'none'
+      ) {
+        const tiffPayload = buildExifTiffPayload(cameraProfile);
+        if (tiffPayload.byteLength > 0) {
+          keptChunks.push(makePngChunk('eXIf', tiffPayload));
+          injectedExif = true;
+        }
+      }
     }
 
     offset += totalChunkLen;
@@ -656,9 +774,13 @@ export function stripPngMetadata(input: Uint8Array): Uint8Array {
 }
 
 /**
- * Losslessly strips EXIF, XMP, and C2PA/JUMB chunks from RIFF WEBP images.
+ * Losslessly strips EXIF, XMP, and C2PA/JUMB chunks from RIFF WEBP images,
+ * and injects a clean DSLR / Mobile Camera EXIF chunk when VP8X is present.
  */
-export function stripWebpMetadata(input: Uint8Array): Uint8Array {
+export function stripWebpMetadata(
+  input: Uint8Array,
+  cameraProfile?: CameraProfile
+): Uint8Array {
   if (
     input.byteLength < 12 ||
     readBoxType(input, 0) !== 'RIFF' ||
@@ -670,6 +792,7 @@ export function stripWebpMetadata(input: Uint8Array): Uint8Array {
   const STRIP_CHUNKS = new Set(['EXIF', 'XMP ', 'C2PA', 'JUMB', 'ICCP']);
   const keptChunks: Uint8Array[] = [];
   let offset = 12;
+  let vp8xChunkRef: Uint8Array | null = null;
 
   while (offset + 8 <= input.byteLength) {
     const fourCC = readBoxType(input, offset);
@@ -688,6 +811,7 @@ export function stripWebpMetadata(input: Uint8Array): Uint8Array {
     // If VP8X extended header exists, clear ICCP (0x20), EXIF (0x08), XMP (0x04) flag bits
     if (fourCC === 'VP8X' && chunkSlice.byteLength >= 12) {
       chunkSlice[8] = chunkSlice[8] & ~(0x20 | 0x08 | 0x04);
+      vp8xChunkRef = chunkSlice;
     }
 
     if (!STRIP_CHUNKS.has(fourCC)) {
@@ -695,6 +819,22 @@ export function stripWebpMetadata(input: Uint8Array): Uint8Array {
     }
 
     offset += totalChunkLen;
+  }
+
+  if (vp8xChunkRef && cameraProfile && cameraProfile.id !== 'none') {
+    const tiffPayload = buildExifTiffPayload(cameraProfile);
+    if (tiffPayload.byteLength > 0) {
+      const paddedLen = tiffPayload.byteLength + (tiffPayload.byteLength % 2);
+      const exifChunk = new Uint8Array(8 + paddedLen);
+      exifChunk[0] = 0x45; // 'E'
+      exifChunk[1] = 0x58; // 'X'
+      exifChunk[2] = 0x49; // 'I'
+      exifChunk[3] = 0x46; // 'F'
+      writeUint32LE(exifChunk, 4, tiffPayload.byteLength);
+      exifChunk.set(tiffPayload, 8);
+      vp8xChunkRef[8] = vp8xChunkRef[8] | 0x08; // Enable EXIF flag
+      keptChunks.push(exifChunk);
+    }
   }
 
   const bodyLen = keptChunks.reduce((acc, c) => acc + c.byteLength, 0);
@@ -712,11 +852,15 @@ export function stripWebpMetadata(input: Uint8Array): Uint8Array {
 
 /**
  * Losslessly strips AI and EXIF/XMP/C2PA metadata from JPG, PNG, and WEBP pictures
- * directly in the browser without re-encoding image pixels.
+ * directly in the browser without re-encoding image pixels, and optionally injects
+ * DSLR or Mobile Camera hardware EXIF metadata.
  */
-export function stripImageMetadataInBrowser(input: Uint8Array): Uint8Array {
+export function stripImageMetadataInBrowser(
+  input: Uint8Array,
+  cameraProfile?: CameraProfile
+): Uint8Array {
   if (input.byteLength >= 2 && input[0] === 0xff && input[1] === 0xd8) {
-    return stripJpegMetadata(input);
+    return stripJpegMetadata(input, cameraProfile);
   }
   if (
     input.byteLength >= 8 &&
@@ -725,14 +869,14 @@ export function stripImageMetadataInBrowser(input: Uint8Array): Uint8Array {
     input[2] === 0x4e &&
     input[3] === 0x47
   ) {
-    return stripPngMetadata(input);
+    return stripPngMetadata(input, cameraProfile);
   }
   if (
     input.byteLength >= 12 &&
     readBoxType(input, 0) === 'RIFF' &&
     readBoxType(input, 8) === 'WEBP'
   ) {
-    return stripWebpMetadata(input);
+    return stripWebpMetadata(input, cameraProfile);
   }
   return input;
 }

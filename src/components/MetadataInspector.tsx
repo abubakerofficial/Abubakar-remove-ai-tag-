@@ -1,10 +1,11 @@
 import React from 'react';
-import { ShieldAlert, ShieldCheck, Check } from 'lucide-react';
+import { ShieldAlert, ShieldCheck, Check, Camera, Smartphone } from 'lucide-react';
 import {
   DetectedMetadataTag,
   MediaKind,
   formatBytes,
 } from '../utils/metadataAnalyzer';
+import { CameraProfile } from '../utils/cameraProfiles';
 
 interface MetadataInspectorProps {
   fileName: string;
@@ -14,6 +15,7 @@ interface MetadataInspectorProps {
   durationMs: number | null;
   detectedTags: DetectedMetadataTag[];
   isCleaned: boolean;
+  cameraProfile: CameraProfile;
 }
 
 export const MetadataInspector: React.FC<MetadataInspectorProps> = ({
@@ -24,9 +26,11 @@ export const MetadataInspector: React.FC<MetadataInspectorProps> = ({
   durationMs,
   detectedTags,
   isCleaned,
+  cameraProfile,
 }) => {
   const bytesRemoved =
     cleanSize !== null ? Math.max(0, originalSize - cleanSize) : null;
+  const hasCameraInjection = cameraProfile.id !== 'none';
 
   return (
     <div className="rounded-xl border border-slate-800 bg-[#0F1624] overflow-hidden">
@@ -60,7 +64,11 @@ export const MetadataInspector: React.FC<MetadataInspectorProps> = ({
           {isCleaned ? (
             <span className="inline-flex items-center gap-1.5 text-emerald-400">
               <ShieldCheck className="w-4 h-4 shrink-0" />
-              <span>0 AI Signatures Remaining (Verified Clean)</span>
+              <span>
+                {hasCameraInjection
+                  ? `0 AI Tags · ${cameraProfile.shortLabel} Injected`
+                  : '0 AI Signatures Remaining (Verified Clean)'}
+              </span>
             </span>
           ) : (
             <span className="inline-flex items-center gap-1.5 text-amber-400">
@@ -110,13 +118,65 @@ export const MetadataInspector: React.FC<MetadataInspectorProps> = ({
                 </td>
               </tr>
             ))}
+
+            {hasCameraInjection && (
+              <tr className="bg-emerald-950/15 hover:bg-emerald-950/25 transition-colors">
+                <td className="py-3 px-5 font-medium text-emerald-300 whitespace-nowrap">
+                  <span className="inline-flex items-center gap-1.5">
+                    {cameraProfile.category === 'mobile' ? (
+                      <Smartphone className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                    ) : (
+                      <Camera className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                    )}
+                    <span>{cameraProfile.badgeText}</span>
+                  </span>
+                </td>
+                <td className="py-3 px-4">
+                  <div className="text-slate-100 font-medium">
+                    {mediaKind === 'image'
+                      ? 'EXIF:Make / Model / LensModel / Software'
+                      : 'QuickTime:Make / Model / Lens / Handler'}
+                  </div>
+                  <div className="font-mono text-[11px] text-slate-400">
+                    {mediaKind === 'image'
+                      ? 'APP1:EXIF IFD0 + ExifIFD / PNG:eXIf'
+                      : 'moov.meta.keys / com.apple.quicktime.*'}
+                  </div>
+                </td>
+                <td className="py-3 px-4 font-mono text-[11px] text-slate-400 max-w-xs truncate">
+                  {cameraProfile.make} {cameraProfile.model} · {cameraProfile.lensModel}
+                </td>
+                <td className="py-3 px-5 text-right whitespace-nowrap">
+                  {isCleaned ? (
+                    <span className="inline-flex items-center justify-end gap-1.5 font-mono text-emerald-400">
+                      <Check className="w-3.5 h-3.5" />
+                      <span>INJECTED</span>
+                    </span>
+                  ) : (
+                    <span className="font-mono text-emerald-400/80">
+                      Queued for auto-inject
+                    </span>
+                  )}
+                </td>
+              </tr>
+            )}
           </tbody>
         </table>
       </div>
 
       {bytesRemoved !== null && (
-        <div className="px-5 py-3 bg-[#090D16]/70 border-t border-slate-800 flex items-center justify-between gap-3 text-xs text-slate-400">
-          <span>Privacy Protected · Zero Server Retention</span>
+        <div className="px-5 py-3 bg-[#090D16]/70 border-t border-slate-800 flex flex-wrap items-center justify-between gap-3 text-xs text-slate-400">
+          <span>
+            Privacy Protected · Zero Server Retention
+            {hasCameraInjection && (
+              <>
+                <span className="mx-2 text-slate-600" aria-hidden="true">·</span>
+                <span className="text-emerald-300">
+                  Hardware ID: {cameraProfile.make} {cameraProfile.model} ({cameraProfile.software})
+                </span>
+              </>
+            )}
+          </span>
           <span className="font-mono tabular-nums text-[11px] text-emerald-400">
             {mediaKind === 'image'
               ? 'Image Pixels: 100% Original Quality'
@@ -127,3 +187,4 @@ export const MetadataInspector: React.FC<MetadataInspectorProps> = ({
     </div>
   );
 };
+

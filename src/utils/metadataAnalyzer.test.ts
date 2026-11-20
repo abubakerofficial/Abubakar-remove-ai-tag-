@@ -14,6 +14,12 @@ import {
   stripJpegMetadata,
   stripWebpMetadata,
 } from './metadataAnalyzer';
+import {
+  getCameraProfile,
+  buildExifTiffPayload,
+  buildMp4CameraMetaBox,
+  buildFfmpegCameraMetadataArgs,
+} from './cameraProfiles';
 
 test('validateVideoFile accepts valid MP4 files and automatically renames to Abubakar Remove AI.mp4', () => {
   const res = validateVideoFile('Runway_Gen3_Scene 01.mp4', 12_500_000, 'video/mp4');
@@ -243,3 +249,95 @@ test('stripWebpMetadata removes EXIF, XMP, and C2PA chunks from RIFF WEBP while 
   assert.ok(text.includes('VP8 '));
   assert.equal(/DALL-E|OpenAI|c2pa|Imagen/i.test(text), false);
 });
+
+test('buildExifTiffPayload produces valid Little-Endian TIFF EXIF with DSLR Make, Model, and Lens', () => {
+  const sony = getCameraProfile('sony_a7iv');
+  const tiff = buildExifTiffPayload(sony, new Date('2026-11-20T12:00:00Z'));
+  assert.equal(tiff[0], 0x49); // 'I'
+  assert.equal(tiff[1], 0x49); // 'I'
+  assert.equal(tiff[2], 0x2a); // 42
+  assert.equal(tiff[3], 0x00);
+
+  const text = new TextDecoder('latin1').decode(tiff);
+  assert.ok(text.includes('SONY'));
+  assert.ok(text.includes('ILCE-7M4'));
+  assert.ok(text.includes('FE 24-70mm F2.8 GM II'));
+  assert.ok(text.includes('ILCE-7M4 v3.01'));
+});
+
+test('stripMp4MetadataInBrowser strips AI tags and injects DSLR or Mobile Camera QuickTime meta atoms', () => {
+  const sampleBuf = createBrowserSampleMp4Buffer('google_flow');
+  const sony = getCameraProfile('sony_a7iv');
+  const dslrMp4 = stripMp4MetadataInBrowser(sampleBuf, sony);
+  const dslrText = new TextDecoder('latin1').decode(dslrMp4);
+
+  assert.equal(/Runway|Google Flow|Luma|Pika|c2pa|TrainedAlgorithmicMedia/i.test(dslrText), false);
+  assert.ok(dslrText.includes('com.apple.quicktime.make'));
+  assert.ok(dslrText.includes('SONY'));
+  assert.ok(dslrText.includes('ILCE-7M4'));
+  assert.ok(dslrText.includes('FE 24-70mm F2.8 GM II'));
+
+  const iphone = getCameraProfile('iphone_16_pro');
+  const mobileMp4 = stripMp4MetadataInBrowser(sampleBuf, iphone);
+  const mobileText = new TextDecoder('latin1').decode(mobileMp4);
+  assert.ok(mobileText.includes('Apple'));
+  assert.ok(mobileText.includes('iPhone 16 Pro Max'));
+});
+
+test('stripJpegMetadata and stripPngMetadata strip AI tags and inject valid DSLR/Mobile EXIF', () => {
+  const enc = new TextEncoder();
+  const makeSeg = (marker: number, payload: Uint8Array) => {
+    const len = 2 + payload.byteLength;
+    const out = new Uint8Array(2 + len);
+    out[0] = 0xff;
+    out[1] = marker;
+    out[2] = (len >>> 8) & 0xff;
+    out[3] = len & 0xff;
+    out.set(payload, 4);
+    return out;
+  };
+
+  const soi = new Uint8Array([0xff, 0xd8]);
+  const app1Ai = makeSeg(0xe1, enc.encode('Exif\0\0Midjourney AI_GENERATED'));
+  const sosHeader = makeSeg(0xda, new Uint8Array([0x03, 0x01, 0x00]));
+  const scanData = new Uint8Array([0x11, 0x22, 0xff, 0xd9]);
+  const parts = [soi, app1Ai, sosHeader, scanData];
+  const jpeg = new Uint8Array(parts.reduce((a, b) => a + b.byteLength, 0));
+  let p = 0;
+  for (const part of parts) {
+    jpeg.set(part, p);
+    p += part.byteLength;
+  }
+
+  const canon = getCameraProfile('canon_r5');
+  const dslrJpeg = stripJpegMetadata(jpeg, canon);
+  const jpegText = new TextDecoder('latin1').decode(dslrJpeg);
+  assert.equal(/Midjourney|AI_GENERATED/i.test(jpegText), false);
+  assert.ok(jpegText.includes('Exif\0\0II*'));
+  assert.ok(jpegText.includes('Canon EOS R5'));
+  assert.ok(jpegText.includes('RF24-70mm F2.8 L IS USM'));
+
+  const samplePng = createBrowserSamplePngBuffer('midjourney');
+  const iphone = getCameraProfile('iphone_16_pro');
+  const mobilePng = stripImageMetadataInBrowser(samplePng, iphone);
+  const pngText = new TextDecoder('latin1').decode(mobilePng);
+  assert.equal(/Midjourney|c2pa|TrainedAlgorithmicMedia/i.test(pngText), false);
+  assert.ok(pngText.includes('eXIf'));
+  assert.ok(pngText.includes('Apple'));
+  assert.ok(pngText.includes('iPhone 16 Pro Max'));
+});
+
+test('buildFfmpegCameraMetadataArgs outputs QuickTime camera metadata flags for DSLR/Mobile and bitexact for none', () => {
+  const sonyArgs = buildFfmpegCameraMetadataArgs(getCameraProfile('sony_a7iv'));
+  assert.ok(sonyArgs.includes('com.apple.quicktime.make=SONY'));
+  assert.ok(sonyArgs.includes('com.apple.quicktime.model=ILCE-7M4'));
+  assert.ok(sonyArgs.includes('+use_metadata_tags+faststart'));
+
+  const metaBox = buildMp4CameraMetaBox(getCameraProfile('samsung_s25_ultra'));
+  const metaText = new TextDecoder('latin1').decode(metaBox);
+  assert.ok(metaText.includes('SM-S938B'));
+
+  const cleanArgs = buildFfmpegCameraMetadataArgs(getCameraProfile('none'));
+  assert.ok(cleanArgs.includes('+bitexact'));
+});
+
