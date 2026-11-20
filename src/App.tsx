@@ -35,6 +35,8 @@ import { CameraProfileSelector } from './components/CameraProfileSelector';
 import {
   CameraProfileId,
   DEFAULT_CAMERA_PROFILE_ID,
+  DEFAULT_VIDEO_CONTAINER,
+  VideoContainerFormat,
   getCameraProfile,
 } from './utils/cameraProfiles';
 
@@ -119,6 +121,9 @@ export default function App() {
   const [cameraProfileId, setCameraProfileId] = useState<CameraProfileId>(
     DEFAULT_CAMERA_PROFILE_ID
   );
+  const [videoContainer, setVideoContainer] = useState<VideoContainerFormat>(
+    DEFAULT_VIDEO_CONTAINER
+  );
 
   const [isProcessing, setIsProcessing] = useState(false);
   const [progress, setProgress] = useState(0);
@@ -162,9 +167,22 @@ export default function App() {
       validation.mediaKind
     );
 
+    const effectiveCleanName =
+      validation.mediaKind === 'video' &&
+      cameraProfileId !== 'none' &&
+      videoContainer === 'mov'
+        ? 'Abubakar Remove AI.mov'
+        : validation.normalizedCleanName;
+    const effectiveOutputMime =
+      validation.mediaKind === 'video' &&
+      cameraProfileId !== 'none' &&
+      videoContainer === 'mov'
+        ? 'video/quicktime'
+        : validation.outputMimeType;
+
     // Automatically rename whatever video or picture is uploaded to "Abubakar Remove AI.<ext>"
-    const renamedFile = new File([arrayBuf], validation.normalizedCleanName, {
-      type: file.type || validation.outputMimeType,
+    const renamedFile = new File([arrayBuf], effectiveCleanName, {
+      type: file.type || effectiveOutputMime,
     });
 
     if (previewImageUrl) {
@@ -182,11 +200,11 @@ export default function App() {
 
     setSelectedFile(renamedFile);
     setSelectedMediaKind(validation.mediaKind);
-    setOutputMimeType(validation.outputMimeType);
+    setOutputMimeType(effectiveOutputMime);
     setDetectedTags(tags);
     setCleanBlobObj(null);
     setCleanDownloadUrl(null);
-    setCleanFileName(validation.normalizedCleanName);
+    setCleanFileName(effectiveCleanName);
     setCleanFileSize(null);
     setProcessDurationMs(null);
     setProgress(0);
@@ -333,9 +351,18 @@ export default function App() {
       let cleanBlob: Blob;
       let cleanBuffer: Uint8Array;
       let serverDuration = 0;
-      const outName = cleanFileName || 'Abubakar Remove AI.mp4';
 
       const activeCameraProfile = getCameraProfile(cameraProfileId);
+      const effectiveContainer: VideoContainerFormat =
+        activeCameraProfile.id === 'none' ? 'mp4' : videoContainer;
+      const effectiveOutName =
+        selectedMediaKind === 'video'
+          ? effectiveContainer === 'mov'
+            ? 'Abubakar Remove AI.mov'
+            : 'Abubakar Remove AI.mp4'
+          : cleanFileName || 'Abubakar Remove AI.png';
+      const effectiveVideoMime =
+        effectiveContainer === 'mov' ? 'video/quicktime' : 'video/mp4';
 
       if (selectedMediaKind === 'image') {
         await new Promise((r) => setTimeout(r, 200));
@@ -370,6 +397,7 @@ export default function App() {
             const formData = new FormData();
             formData.append('video', selectedFile);
             formData.append('cameraProfile', activeCameraProfile.id);
+            formData.append('containerFormat', effectiveContainer);
 
             const response = await fetch('/api/strip-metadata', {
               method: 'POST',
@@ -377,7 +405,11 @@ export default function App() {
             });
 
             const contentType = response.headers.get('Content-Type') || '';
-            if (!response.ok || !contentType.includes('video/mp4')) {
+            if (
+              !response.ok ||
+              (!contentType.includes('video/mp4') &&
+                !contentType.includes('video/quicktime'))
+            ) {
               throw new Error('Fallback to in-browser scrubber');
             }
 
@@ -389,21 +421,30 @@ export default function App() {
             );
           } catch {
             const rawBytes = new Uint8Array(await selectedFile.arrayBuffer());
-            cleanBuffer = stripMp4MetadataInBrowser(rawBytes, activeCameraProfile);
+            cleanBuffer = stripMp4MetadataInBrowser(
+              rawBytes,
+              activeCameraProfile,
+              effectiveContainer
+            );
             cleanBlob = new Blob([cleanBuffer as unknown as BlobPart], {
-              type: 'video/mp4',
+              type: effectiveVideoMime,
             });
             serverDuration = Math.max(10, Math.round(performance.now() - startTime));
           }
         } else {
           await new Promise((r) => setTimeout(r, 240));
           const rawBytes = new Uint8Array(await selectedFile.arrayBuffer());
-          cleanBuffer = stripMp4MetadataInBrowser(rawBytes, activeCameraProfile);
+          cleanBuffer = stripMp4MetadataInBrowser(
+            rawBytes,
+            activeCameraProfile,
+            effectiveContainer
+          );
           cleanBlob = new Blob([cleanBuffer as unknown as BlobPart], {
-            type: 'video/mp4',
+            type: effectiveVideoMime,
           });
           serverDuration = Math.max(12, Math.round(performance.now() - startTime));
         }
+        setOutputMimeType(effectiveVideoMime);
       }
 
       if (cleanDownloadUrl) {
@@ -417,7 +458,7 @@ export default function App() {
 
       setCleanBlobObj(cleanBlob);
       setCleanDownloadUrl(url);
-      setCleanFileName(outName);
+      setCleanFileName(effectiveOutName);
       setCleanFileSize(cleanBuffer.byteLength);
       setProcessDurationMs(serverDuration);
 
@@ -425,7 +466,7 @@ export default function App() {
         id: `${Date.now()}`,
         mediaKind: selectedMediaKind,
         originalName: selectedFile.name,
-        cleanName: outName,
+        cleanName: effectiveOutName,
         cameraProfileLabel: activeCameraProfile.shortLabel,
         originalSize: selectedFile.size,
         cleanSize: cleanBuffer.byteLength,
@@ -449,7 +490,7 @@ export default function App() {
       triggerToast(
         'success',
         'AI Metadata Removed & Camera Ready',
-        `Stripped ${detectedTags.length} AI tags in ${serverDuration} ms.${cameraNote} Ready to download as "${outName}".`
+        `Stripped ${detectedTags.length} AI tags in ${serverDuration} ms.${cameraNote} Ready to download as "${effectiveOutName}".`
       );
     } catch (error: unknown) {
       clearInterval(progressTimer);
@@ -489,6 +530,31 @@ export default function App() {
 
   const handleSelectCameraProfile = (id: CameraProfileId) => {
     setCameraProfileId(id);
+    if (selectedMediaKind === 'video') {
+      const nextName =
+        id !== 'none' && videoContainer === 'mov'
+          ? 'Abubakar Remove AI.mov'
+          : 'Abubakar Remove AI.mp4';
+      setCleanFileName(nextName);
+    }
+    if (cleanDownloadUrl) {
+      URL.revokeObjectURL(cleanDownloadUrl);
+      setCleanDownloadUrl(null);
+      setCleanBlobObj(null);
+      setCleanFileSize(null);
+      setProcessDurationMs(null);
+    }
+  };
+
+  const handleSelectVideoContainer = (fmt: VideoContainerFormat) => {
+    setVideoContainer(fmt);
+    if (selectedMediaKind === 'video') {
+      setCleanFileName(
+        fmt === 'mov' && cameraProfileId !== 'none'
+          ? 'Abubakar Remove AI.mov'
+          : 'Abubakar Remove AI.mp4'
+      );
+    }
     if (cleanDownloadUrl) {
       URL.revokeObjectURL(cleanDownloadUrl);
       setCleanDownloadUrl(null);
@@ -875,6 +941,8 @@ export default function App() {
               <CameraProfileSelector
                 selectedProfileId={cameraProfileId}
                 onSelect={handleSelectCameraProfile}
+                videoContainer={videoContainer}
+                onSelectContainer={handleSelectVideoContainer}
                 disabled={isProcessing}
               />
             </div>

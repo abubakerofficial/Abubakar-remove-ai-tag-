@@ -4,17 +4,22 @@ import {
   CAMERA_PROFILES,
   CameraProfile,
   CameraProfileId,
+  VideoContainerFormat,
 } from '../utils/cameraProfiles';
 
 interface CameraProfileSelectorProps {
   selectedProfileId: CameraProfileId;
   onSelect: (id: CameraProfileId) => void;
+  videoContainer: VideoContainerFormat;
+  onSelectContainer: (fmt: VideoContainerFormat) => void;
   disabled?: boolean;
 }
 
 export const CameraProfileSelector: React.FC<CameraProfileSelectorProps> = ({
   selectedProfileId,
   onSelect,
+  videoContainer,
+  onSelectContainer,
   disabled = false,
 }) => {
   const activeProfile: CameraProfile =
@@ -43,7 +48,7 @@ export const CameraProfileSelector: React.FC<CameraProfileSelectorProps> = ({
       </div>
 
       <p className="text-xs text-slate-400 leading-relaxed">
-        After stripping all AI tags, every uploaded file automatically receives genuine camera hardware metadata so TikTok, YouTube, and Instagram recognize it as real camera footage.
+        Replaces <span className="text-slate-200">&ldquo;No camera information&rdquo;</span> &amp; <span className="text-slate-200">&ldquo;No lens information&rdquo;</span> in iPhone Photos, Android, TikTok &amp; YouTube with genuine QuickTime camera &amp; lens hardware metadata.
       </p>
 
       <div
@@ -102,6 +107,41 @@ export const CameraProfileSelector: React.FC<CameraProfileSelectorProps> = ({
           );
         })}
       </div>
+
+      {activeProfile.id !== 'none' && (
+        <div className="pt-1 border-t border-slate-800/80 flex flex-wrap items-center justify-between gap-2.5 text-xs">
+          <span className="text-slate-400">
+            Video Container Format:
+          </span>
+          <div className="flex items-center gap-1 p-1 rounded-lg bg-[#090D16] border border-slate-800">
+            <button
+              type="button"
+              disabled={disabled}
+              onClick={() => onSelectContainer('mov')}
+              className={`px-2.5 py-1 text-[11px] font-medium rounded-md transition-colors whitespace-nowrap cursor-pointer disabled:opacity-50 ${
+                videoContainer === 'mov'
+                  ? 'bg-emerald-400 text-slate-950 font-semibold'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              QuickTime .MOV (iPhone &amp; DSLR Native)
+            </button>
+            <button
+              type="button"
+              disabled={disabled}
+              onClick={() => onSelectContainer('mp4')}
+              className={`px-2.5 py-1 text-[11px] font-medium rounded-md transition-colors whitespace-nowrap cursor-pointer disabled:opacity-50 ${
+                videoContainer === 'mp4'
+                  ? 'bg-emerald-400 text-slate-950 font-semibold'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              Standard .MP4
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
+

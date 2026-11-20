@@ -8,9 +8,12 @@ import crypto from 'crypto';
 import { createServer as createViteServer } from 'vite';
 import {
   DEFAULT_CAMERA_PROFILE_ID,
+  DEFAULT_VIDEO_CONTAINER,
+  VideoContainerFormat,
   getCameraProfile,
   buildFfmpegCameraMetadataArgs,
 } from './src/utils/cameraProfiles';
+import { stripMp4MetadataInBrowser } from './src/utils/metadataAnalyzer';
 
 const PORT = 3000;
 
@@ -150,15 +153,33 @@ async function startServer() {
 
     const inputPath = uploadedFile.path;
     const outputId = crypto.randomUUID();
-    const outputPath = path.join(os.tmpdir(), `abubakar_clean_${outputId}.mp4`);
-
-    const downloadFileName = 'Abubakar Remove AI.mp4';
     const requestedProfileId =
       typeof req.body?.cameraProfile === 'string'
         ? req.body.cameraProfile
         : DEFAULT_CAMERA_PROFILE_ID;
     const cameraProfile = getCameraProfile(requestedProfileId);
-    const cameraFfmpegArgs = buildFfmpegCameraMetadataArgs(cameraProfile);
+    const requestedContainer: VideoContainerFormat =
+      req.body?.containerFormat === 'mp4'
+        ? 'mp4'
+        : req.body?.containerFormat === 'mov'
+          ? 'mov'
+          : DEFAULT_VIDEO_CONTAINER;
+    const effectiveFormat: VideoContainerFormat =
+      cameraProfile.id === 'none' ? 'mp4' : requestedContainer;
+    const isMov = effectiveFormat === 'mov';
+
+    const outputPath = path.join(
+      os.tmpdir(),
+      `abubakar_clean_${outputId}.${effectiveFormat}`
+    );
+    const downloadFileName = isMov
+      ? 'Abubakar Remove AI.mov'
+      : 'Abubakar Remove AI.mp4';
+    const outputMime = isMov ? 'video/quicktime' : 'video/mp4';
+    const cameraFfmpegArgs = buildFfmpegCameraMetadataArgs(
+      cameraProfile,
+      effectiveFormat
+    );
 
     try {
       await new Promise<void>((resolve, reject) => {
@@ -180,24 +201,32 @@ async function startServer() {
           .run();
       });
 
-      const [inStat, outStat, cleanBuffer] = await Promise.all([
+      const [inStat, ffmpegOutBuffer] = await Promise.all([
         fs.promises.stat(inputPath),
-        fs.promises.stat(outputPath),
         fs.promises.readFile(outputPath),
       ]);
+
+      // Apply exact Apple QuickTime `moov.meta` (direct child of `moov`), video track
+      // `moov.trak[vide].meta` (LensModel + FocalLength), `moov.udta`, and `stco`/`co64` patching
+      const finalUint8 = stripMp4MetadataInBrowser(
+        new Uint8Array(ffmpegOutBuffer),
+        cameraProfile,
+        effectiveFormat
+      );
+      const cleanBuffer = Buffer.from(finalUint8);
 
       const durationMs = Math.max(1, Date.now() - startTime);
 
       // Immediately clean up temporary files from the server
       await Promise.all([safeUnlink(inputPath), safeUnlink(outputPath)]);
 
-      res.setHeader('Content-Type', 'video/mp4');
+      res.setHeader('Content-Type', outputMime);
       res.setHeader(
         'Content-Disposition',
         `attachment; filename="${downloadFileName}"`
       );
       res.setHeader('X-Original-Size', String(inStat.size));
-      res.setHeader('X-Clean-Size', String(outStat.size));
+      res.setHeader('X-Clean-Size', String(cleanBuffer.byteLength));
       res.setHeader('X-Process-Duration-Ms', String(durationMs));
       res.setHeader('X-Clean-Filename', downloadFileName);
       res.setHeader('X-Camera-Profile', cameraProfile.id);
@@ -209,22 +238,20 @@ async function startServer() {
       res.status(200).send(cleanBuffer);
     } catch (error: unknown) {
       // Fallback: if FFmpeg stream copy encounters a non-standard QuickTime data track,
-      // perform lossless ISO MP4/MOV atom scrubbing + camera profile injection directly on the binary buffer
+      // perform lossless ISO MP4/MOV atom scrubbing + native QuickTime camera injection directly
       try {
         const rawBuf = await fs.promises.readFile(inputPath);
-        const { stripMp4MetadataInBrowser } = await import(
-          './src/utils/metadataAnalyzer.ts'
-        );
         const scrubbedArr = stripMp4MetadataInBrowser(
           new Uint8Array(rawBuf),
-          cameraProfile
+          cameraProfile,
+          effectiveFormat
         );
         const cleanBuffer = Buffer.from(scrubbedArr);
         const durationMs = Math.max(1, Date.now() - startTime);
 
         await Promise.all([safeUnlink(inputPath), safeUnlink(outputPath)]);
 
-        res.setHeader('Content-Type', 'video/mp4');
+        res.setHeader('Content-Type', outputMime);
         res.setHeader(
           'Content-Disposition',
           `attachment; filename="${downloadFileName}"`

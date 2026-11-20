@@ -98,7 +98,7 @@ test('stripMp4MetadataInBrowser removes all AI signatures from sample MP4 buffer
   assert.equal(/Runway|Google Flow|Luma|Pika|c2pa/i.test(cleanedText), false);
 });
 
-test('stripMp4MetadataInBrowser parses real MP4 box tree, converts udta/uuid to free, and preserves mdat bytes', () => {
+test('stripMp4MetadataInBrowser parses real MP4 box tree, strips udta/uuid AI boxes, and preserves mdat bytes', () => {
   const makeBox = (type: string, payload: Uint8Array): Uint8Array => {
     const size = 8 + payload.byteLength;
     const out = new Uint8Array(size);
@@ -133,18 +133,12 @@ test('stripMp4MetadataInBrowser parses real MP4 box tree, converts udta/uuid to 
   }
 
   const scrubbed = stripMp4MetadataInBrowser(mp4);
-  assert.equal(scrubbed.byteLength, mp4.byteLength);
-
   const dec = new TextDecoder('latin1');
-  const beforeMdatText = dec.decode(
-    scrubbed.subarray(0, ftyp.byteLength + moov.byteLength + uuid.byteLength)
-  );
+  const mdatStartIdx = scrubbed.byteLength - mdatPayload.byteLength;
+  const beforeMdatText = dec.decode(scrubbed.subarray(0, mdatStartIdx));
   assert.equal(/Runway|Google Flow|Luma|Pika|c2pa/i.test(beforeMdatText), false);
 
-  const mdatSlice = scrubbed.subarray(
-    mp4.byteLength - mdatPayload.byteLength,
-    mp4.byteLength
-  );
+  const mdatSlice = scrubbed.subarray(mdatStartIdx, scrubbed.byteLength);
   assert.equal(dec.decode(mdatSlice), 'RAW_VIDEO_FRAME_BYTES_Runway_SHOULD_NOT_BE_TOUCHED');
 });
 
@@ -268,7 +262,7 @@ test('buildExifTiffPayload produces valid Little-Endian TIFF EXIF with DSLR Make
 test('stripMp4MetadataInBrowser strips AI tags and injects DSLR or Mobile Camera QuickTime meta atoms', () => {
   const sampleBuf = createBrowserSampleMp4Buffer('google_flow');
   const sony = getCameraProfile('sony_a7iv');
-  const dslrMp4 = stripMp4MetadataInBrowser(sampleBuf, sony);
+  const dslrMp4 = stripMp4MetadataInBrowser(sampleBuf, sony, 'mov');
   const dslrText = new TextDecoder('latin1').decode(dslrMp4);
 
   assert.equal(/Runway|Google Flow|Luma|Pika|c2pa|TrainedAlgorithmicMedia/i.test(dslrText), false);
@@ -278,10 +272,75 @@ test('stripMp4MetadataInBrowser strips AI tags and injects DSLR or Mobile Camera
   assert.ok(dslrText.includes('FE 24-70mm F2.8 GM II'));
 
   const iphone = getCameraProfile('iphone_16_pro');
-  const mobileMp4 = stripMp4MetadataInBrowser(sampleBuf, iphone);
+  const mobileMp4 = stripMp4MetadataInBrowser(sampleBuf, iphone, 'mov');
   const mobileText = new TextDecoder('latin1').decode(mobileMp4);
   assert.ok(mobileText.includes('Apple'));
   assert.ok(mobileText.includes('iPhone 16 Pro Max'));
+});
+
+test('stripMp4MetadataInBrowser rebuilds moov before mdat with QuickTime ftyp, moov.meta, video trak.meta, and exact stco shift', () => {
+  const makeBox = (type: string, payload: Uint8Array): Uint8Array => {
+    const size = 8 + payload.byteLength;
+    const out = new Uint8Array(size);
+    new DataView(out.buffer).setUint32(0, size, false);
+    for (let i = 0; i < 4; i++) out[4 + i] = type.charCodeAt(i);
+    out.set(payload, 8);
+    return out;
+  };
+  const concat = (arrs: Uint8Array[]) => {
+    const out = new Uint8Array(arrs.reduce((a, b) => a + b.byteLength, 0));
+    let p = 0;
+    for (const a of arrs) {
+      out.set(a, p);
+      p += a.byteLength;
+    }
+    return out;
+  };
+
+  const enc = new TextEncoder();
+  const ftyp = makeBox('ftyp', enc.encode('isom0000isommp42'));
+  const hdlrPayload = new Uint8Array(25);
+  hdlrPayload.set(enc.encode('vide'), 8);
+  const hdlr = makeBox('hdlr', hdlrPayload);
+
+  // stco pointing to mdat payload
+  const stcoPayload = new Uint8Array(12);
+  const stcoView = new DataView(stcoPayload.buffer);
+  stcoView.setUint32(4, 1, false); // entry_count = 1
+  const stcoPlaceholder = makeBox('stco', stcoPayload);
+  const stbl = makeBox('stbl', stcoPlaceholder);
+  const minf = makeBox('minf', stbl);
+  const mdia = makeBox('mdia', concat([hdlr, minf]));
+  const trak = makeBox('trak', mdia);
+  const aiUdta = makeBox('udta', enc.encode('Google Flow Runway c2pa.jumbf'));
+  const moov = makeBox('moov', concat([trak, aiUdta]));
+  const mdatPayload = enc.encode('FRAME_PAYLOAD_1234567890');
+  const mdat = makeBox('mdat', mdatPayload);
+
+  const initialMdatOffset = ftyp.byteLength + moov.byteLength;
+  const fullMp4 = concat([ftyp, moov, mdat]);
+  // Patch initial stco to point to initialMdatOffset + 8
+  const stcoIdx = new TextDecoder('latin1').decode(fullMp4).indexOf('stco');
+  new DataView(fullMp4.buffer).setUint32(stcoIdx + 12, initialMdatOffset + 8, false);
+
+  const iphone = getCameraProfile('iphone_16_pro');
+  const outMov = stripMp4MetadataInBrowser(fullMp4, iphone, 'mov');
+  const outText = new TextDecoder('latin1').decode(outMov);
+
+  // Must start with QuickTime qt ftyp
+  assert.ok(outText.slice(4, 12) === 'ftypqt  ');
+  // AI tags stripped
+  assert.equal(/Google Flow|Runway|c2pa/i.test(outText), false);
+  // Camera & lens injected inside moov and video trak
+  assert.ok(outText.includes('com.apple.quicktime.make'));
+  assert.ok(outText.includes('iPhone 16 Pro Max'));
+  assert.ok(outText.includes('com.apple.quicktime.camera.lens_model'));
+
+  // Verify stco was shifted to the exact new mdat payload offset
+  const newMdatBoxIdx = outText.indexOf('mdat') - 4;
+  const newStcoIdx = outText.indexOf('stco');
+  const patchedOffset = new DataView(outMov.buffer).getUint32(newStcoIdx + 12, false);
+  assert.equal(patchedOffset, newMdatBoxIdx + 8);
 });
 
 test('stripJpegMetadata and stripPngMetadata strip AI tags and inject valid DSLR/Mobile EXIF', () => {
@@ -327,17 +386,17 @@ test('stripJpegMetadata and stripPngMetadata strip AI tags and inject valid DSLR
   assert.ok(pngText.includes('iPhone 16 Pro Max'));
 });
 
-test('buildFfmpegCameraMetadataArgs outputs QuickTime camera metadata flags for DSLR/Mobile and bitexact for none', () => {
-  const sonyArgs = buildFfmpegCameraMetadataArgs(getCameraProfile('sony_a7iv'));
-  assert.ok(sonyArgs.includes('com.apple.quicktime.make=SONY'));
-  assert.ok(sonyArgs.includes('com.apple.quicktime.model=ILCE-7M4'));
-  assert.ok(sonyArgs.includes('+use_metadata_tags+faststart'));
+test('buildFfmpegCameraMetadataArgs outputs QuickTime mov flag for DSLR/Mobile and bitexact for none', () => {
+  const sonyArgs = buildFfmpegCameraMetadataArgs(getCameraProfile('sony_a7iv'), 'mov');
+  assert.ok(sonyArgs.includes('-f'));
+  assert.ok(sonyArgs.includes('mov'));
+  assert.ok(sonyArgs.includes('+bitexact'));
 
   const metaBox = buildMp4CameraMetaBox(getCameraProfile('samsung_s25_ultra'));
   const metaText = new TextDecoder('latin1').decode(metaBox);
   assert.ok(metaText.includes('SM-S938B'));
 
-  const cleanArgs = buildFfmpegCameraMetadataArgs(getCameraProfile('none'));
+  const cleanArgs = buildFfmpegCameraMetadataArgs(getCameraProfile('none'), 'mp4');
   assert.ok(cleanArgs.includes('+bitexact'));
 });
 

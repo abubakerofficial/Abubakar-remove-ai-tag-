@@ -1,7 +1,12 @@
 import {
   CameraProfile,
+  VideoContainerFormat,
   buildExifTiffPayload,
   buildMp4CameraMetaBox,
+  buildQuickTimeFtypBox,
+  buildQuickTimeUdtaBox,
+  concatUint8Arrays,
+  makeIsoBox,
 } from './cameraProfiles';
 
 export type MediaKind = 'video' | 'image';
@@ -514,91 +519,303 @@ function walkAndScrubMp4Boxes(
   return parsedValidBoxes;
 }
 
+interface ParsedIsoBox {
+  type: string;
+  start: number;
+  end: number;
+  headerSize: number;
+  data: Uint8Array;
+}
+
+function parseChildBoxes(
+  buf: Uint8Array,
+  start: number,
+  end: number
+): ParsedIsoBox[] {
+  const boxes: ParsedIsoBox[] = [];
+  let offset = start;
+
+  while (offset + 8 <= end) {
+    let boxSize = readUint32BE(buf, offset);
+    const boxType = readBoxType(buf, offset + 4);
+    let headerSize = 8;
+
+    if (!/^[\x20-\x7E]{4}$/.test(boxType)) {
+      return [];
+    }
+
+    if (boxSize === 1) {
+      if (offset + 16 > end) return [];
+      const high = readUint32BE(buf, offset + 8);
+      const low = readUint32BE(buf, offset + 12);
+      boxSize = high * 4294967296 + low;
+      headerSize = 16;
+    } else if (boxSize === 0) {
+      boxSize = end - offset;
+    }
+
+    if (boxSize < headerSize || offset + boxSize > end) {
+      return [];
+    }
+
+    const boxEnd = offset + boxSize;
+    boxes.push({
+      type: boxType,
+      start: offset,
+      end: boxEnd,
+      headerSize,
+      data: buf.subarray(offset, boxEnd),
+    });
+    offset = boxEnd;
+  }
+
+  return offset === end ? boxes : [];
+}
+
+function isVideoTrakBox(trakData: Uint8Array, trakHeaderSize: number): boolean {
+  const trakChildren = parseChildBoxes(
+    trakData,
+    trakHeaderSize,
+    trakData.byteLength
+  );
+  const mdia = trakChildren.find((b) => b.type === 'mdia');
+  if (!mdia) return false;
+  const mdiaChildren = parseChildBoxes(
+    mdia.data,
+    mdia.headerSize,
+    mdia.data.byteLength
+  );
+  const hdlr = mdiaChildren.find((b) => b.type === 'hdlr');
+  if (!hdlr || hdlr.data.byteLength < hdlr.headerSize + 12) return false;
+  // hdlr FullBox: 4B version/flags + 4B pre_defined + 4B handler_type ('vide')
+  const subtype = readBoxType(hdlr.data, hdlr.headerSize + 8);
+  return subtype === 'vide';
+}
+
+function patchChunkOffsetsRecursive(
+  buf: Uint8Array,
+  start: number,
+  end: number,
+  delta: number
+) {
+  const CONTAINER_SET = new Set(['moov', 'trak', 'mdia', 'minf', 'stbl']);
+  let offset = start;
+
+  while (offset + 8 <= end) {
+    let boxSize = readUint32BE(buf, offset);
+    const boxType = readBoxType(buf, offset + 4);
+    let headerSize = 8;
+
+    if (!/^[\x20-\x7E]{4}$/.test(boxType)) break;
+    if (boxSize === 1) {
+      if (offset + 16 > end) break;
+      const high = readUint32BE(buf, offset + 8);
+      const low = readUint32BE(buf, offset + 12);
+      boxSize = high * 4294967296 + low;
+      headerSize = 16;
+    } else if (boxSize === 0) {
+      boxSize = end - offset;
+    }
+    if (boxSize < headerSize || offset + boxSize > end) break;
+
+    const boxEnd = offset + boxSize;
+    const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+
+    if (boxType === 'stco' && offset + headerSize + 8 <= boxEnd) {
+      const entryCount = view.getUint32(offset + headerSize + 4, false);
+      let entryPos = offset + headerSize + 8;
+      for (let i = 0; i < entryCount && entryPos + 4 <= boxEnd; i++) {
+        const oldVal = view.getUint32(entryPos, false);
+        const newVal = Math.max(0, oldVal + delta);
+        view.setUint32(entryPos, newVal >>> 0, false);
+        entryPos += 4;
+      }
+    } else if (boxType === 'co64' && offset + headerSize + 8 <= boxEnd) {
+      const entryCount = view.getUint32(offset + headerSize + 4, false);
+      let entryPos = offset + headerSize + 8;
+      const deltaBig = BigInt(delta);
+      for (let i = 0; i < entryCount && entryPos + 8 <= boxEnd; i++) {
+        const oldVal = view.getBigUint64(entryPos, false);
+        const newVal = oldVal + deltaBig;
+        view.setBigUint64(entryPos, newVal >= 0n ? newVal : 0n, false);
+        entryPos += 8;
+      }
+    } else if (CONTAINER_SET.has(boxType)) {
+      patchChunkOffsetsRecursive(buf, offset + headerSize, boxEnd, delta);
+    }
+
+    offset = boxEnd;
+  }
+}
+
 /**
- * Losslessly scrubs MP4/MOV metadata boxes (udta, meta, XMP_, C2PA uuid, ilst) and AI generator
- * signatures directly in the browser ArrayBuffer by converting metadata atoms to MP4 `free`
- * padding boxes and zeroing (0x00) their payloads while skipping `mdat` media frames.
- * When a DSLR or Mobile Camera profile is provided, injects genuine QuickTime/ISO camera
- * hardware metadata (`com.apple.quicktime.make/model/software/creationdate/lens_model`)
- * without shifting any `mdat` chunk offsets (`stco`/`co64`).
+ * Losslessly scrubs MP4/MOV metadata boxes (`udta`, `meta`, `XMP_`, C2PA `uuid`, `ilst`)
+ * and rebuilds `moov` cleanly so native Apple QuickTime `moov.meta` (direct child of `moov`),
+ * video track `moov.trak[vide].meta` (lens_model & focal_length_35mm), and `moov.udta`
+ * (`©mak`/`©mod`/`©swr`/`©day`) are embedded with exact `stco`/`co64` chunk offset patching.
+ * Works identically in Node.js and in-browser (Vercel / InfinityFree) with zero re-encoding.
  */
 export function stripMp4MetadataInBrowser(
   input: Uint8Array,
-  cameraProfile?: CameraProfile
+  cameraProfile?: CameraProfile,
+  containerFormat: VideoContainerFormat = 'mov'
 ): Uint8Array {
-  const output = new Uint8Array(input.byteLength);
-  output.set(input);
+  const topBoxes = parseChildBoxes(input, 0, input.byteLength);
+  const hasRealMoov = topBoxes.some((b) => b.type === 'moov');
 
-  const walked = walkAndScrubMp4Boxes(output, 0, output.byteLength, 0);
+  // Fallback path for synthetic flat test buffers without valid ISO box headers
+  if (!hasRealMoov) {
+    const output = new Uint8Array(input.byteLength);
+    output.set(input);
+    const walked = walkAndScrubMp4Boxes(output, 0, output.byteLength, 0);
+    if (!walked) {
+      const headEnd = Math.min(output.byteLength, 524288);
+      wipeSignaturesInRange(output, 0, headEnd);
+      if (output.byteLength > 524288) {
+        const tailStart = Math.max(headEnd, output.byteLength - 524288);
+        wipeSignaturesInRange(output, tailStart, output.byteLength);
+      }
+    }
+    if (!cameraProfile || cameraProfile.id === 'none') {
+      return output;
+    }
+    const metaBox = buildMp4CameraMetaBox(cameraProfile, new Date(), {
+      isQuickTimeAtom: containerFormat === 'mov',
+    });
+    return concatUint8Arrays([output, metaBox]);
+  }
 
-  if (!walked) {
-    const headEnd = Math.min(output.byteLength, 524288);
-    wipeSignaturesInRange(output, 0, headEnd);
-    if (output.byteLength > 524288) {
-      const tailStart = Math.max(headEnd, output.byteLength - 524288);
-      wipeSignaturesInRange(output, tailStart, output.byteLength);
+  const STRIP_BOXES = new Set(['udta', 'meta', 'XMP_', 'ilst', 'uuid']);
+  const injectCamera = Boolean(cameraProfile && cameraProfile.id !== 'none');
+  const isMov = injectCamera && containerFormat === 'mov';
+  const captureDate = new Date();
+
+  const oldMdatBox = topBoxes.find((b) => b.type === 'mdat');
+  const oldMdatStart = oldMdatBox ? oldMdatBox.start : -1;
+
+  const rebuiltTopBoxes: Array<{ type: string; bytes: Uint8Array }> = [];
+
+  for (const box of topBoxes) {
+    if (STRIP_BOXES.has(box.type)) {
+      continue;
+    }
+
+    if (box.type === 'ftyp') {
+      const ftypBytes = isMov
+        ? buildQuickTimeFtypBox()
+        : new Uint8Array(box.data);
+      rebuiltTopBoxes.push({ type: 'ftyp', bytes: ftypBytes });
+      continue;
+    }
+
+    if (box.type === 'moov') {
+      const moovChildren = parseChildBoxes(
+        box.data,
+        box.headerSize,
+        box.data.byteLength
+      );
+
+      if (moovChildren.length === 0) {
+        const fallbackCopy = new Uint8Array(box.data);
+        walkAndScrubMp4Boxes(fallbackCopy, 0, fallbackCopy.byteLength, 0);
+        rebuiltTopBoxes.push({ type: 'moov', bytes: fallbackCopy });
+        continue;
+      }
+
+      const newMoovChildren: Uint8Array[] = [];
+
+      for (const child of moovChildren) {
+        if (STRIP_BOXES.has(child.type)) {
+          continue;
+        }
+
+        if (child.type === 'trak') {
+          const trakChildren = parseChildBoxes(
+            child.data,
+            child.headerSize,
+            child.data.byteLength
+          );
+          if (trakChildren.length > 0) {
+            const cleanTrakChildren: Uint8Array[] = [];
+            for (const tc of trakChildren) {
+              if (!STRIP_BOXES.has(tc.type)) {
+                cleanTrakChildren.push(new Uint8Array(tc.data));
+              }
+            }
+            if (
+              injectCamera &&
+              cameraProfile &&
+              isVideoTrakBox(child.data, child.headerSize)
+            ) {
+              const trakMeta = buildMp4CameraMetaBox(cameraProfile, captureDate, {
+                isQuickTimeAtom: isMov,
+                trackOnly: true,
+              });
+              if (trakMeta.byteLength > 0) {
+                cleanTrakChildren.push(trakMeta);
+              }
+            }
+            newMoovChildren.push(
+              makeIsoBox('trak', concatUint8Arrays(cleanTrakChildren))
+            );
+          } else {
+            newMoovChildren.push(new Uint8Array(child.data));
+          }
+        } else {
+          newMoovChildren.push(new Uint8Array(child.data));
+        }
+      }
+
+      if (injectCamera && cameraProfile) {
+        // 1. Direct child `moov.meta` (exact Apple QTFF non-FullBox atom for .mov, FullBox for .mp4)
+        const moovMeta = buildMp4CameraMetaBox(cameraProfile, captureDate, {
+          isQuickTimeAtom: isMov,
+          trackOnly: false,
+        });
+        if (moovMeta.byteLength > 0) {
+          newMoovChildren.push(moovMeta);
+        }
+
+        // 2. Classic `moov.udta` with `©mak`, `©mod`, `©swr`, `©day`
+        const moovUdta = buildQuickTimeUdtaBox(cameraProfile, captureDate);
+        if (moovUdta.byteLength > 0) {
+          newMoovChildren.push(moovUdta);
+        }
+      }
+
+      const newMoovBytes = makeIsoBox('moov', concatUint8Arrays(newMoovChildren));
+      rebuiltTopBoxes.push({ type: 'moov', bytes: newMoovBytes });
+      continue;
+    }
+
+    // Preserve `mdat`, `wide`, `free`, etc. untouched (zero re-encoding)
+    rebuiltTopBoxes.push({ type: box.type, bytes: box.data });
+  }
+
+  // Compute exact byte offset shift of `mdat` and patch every `stco` / `co64` inside `moov`
+  if (oldMdatStart >= 0) {
+    let newMdatStart = 0;
+    for (const item of rebuiltTopBoxes) {
+      if (item.type === 'mdat') break;
+      newMdatStart += item.bytes.byteLength;
+    }
+
+    const delta = newMdatStart - oldMdatStart;
+    if (delta !== 0) {
+      for (const item of rebuiltTopBoxes) {
+        if (item.type === 'moov') {
+          patchChunkOffsetsRecursive(
+            item.bytes,
+            8,
+            item.bytes.byteLength,
+            delta
+          );
+        }
+      }
     }
   }
 
-  if (!cameraProfile || cameraProfile.id === 'none') {
-    return output;
-  }
-
-  const cameraMetaBox = buildMp4CameraMetaBox(cameraProfile);
-  if (cameraMetaBox.byteLength === 0) {
-    return output;
-  }
-
-  // Check if the final top-level box is `moov` (standard 32-bit size header) so we can
-  // safely place `meta` inside `moov` without shifting any `mdat` offsets.
-  let offset = 0;
-  let lastMoovOffset = -1;
-  let lastMoovEnd = -1;
-  let lastMoovIs32Bit = false;
-
-  while (offset + 8 <= output.byteLength) {
-    let boxSize = readUint32BE(output, offset);
-    const boxType = readBoxType(output, offset + 4);
-    if (!/^[\x20-\x7E]{4}$/.test(boxType)) break;
-    let is32Bit = true;
-    if (boxSize === 1) {
-      if (offset + 16 > output.byteLength) break;
-      const high = readUint32BE(output, offset + 8);
-      const low = readUint32BE(output, offset + 12);
-      boxSize = high * 4294967296 + low;
-      is32Bit = false;
-    } else if (boxSize === 0) {
-      boxSize = output.byteLength - offset;
-      is32Bit = false;
-    }
-    if (boxSize < 8 || offset + boxSize > output.byteLength) break;
-    if (boxType === 'moov') {
-      lastMoovOffset = offset;
-      lastMoovEnd = offset + boxSize;
-      lastMoovIs32Bit = is32Bit;
-    }
-    offset += boxSize;
-  }
-
-  const combined = new Uint8Array(output.byteLength + cameraMetaBox.byteLength);
-  combined.set(output, 0);
-  combined.set(cameraMetaBox, output.byteLength);
-
-  if (
-    lastMoovOffset >= 0 &&
-    lastMoovEnd === output.byteLength &&
-    lastMoovIs32Bit
-  ) {
-    // Expand trailing `moov` box size so `meta` is a direct child of `moov`
-    const oldMoovSize = readUint32BE(combined, lastMoovOffset);
-    const newMoovSize = oldMoovSize + cameraMetaBox.byteLength;
-    combined[lastMoovOffset] = (newMoovSize >>> 24) & 0xff;
-    combined[lastMoovOffset + 1] = (newMoovSize >>> 16) & 0xff;
-    combined[lastMoovOffset + 2] = (newMoovSize >>> 8) & 0xff;
-    combined[lastMoovOffset + 3] = newMoovSize & 0xff;
-  }
-
-  return combined;
+  return concatUint8Arrays(rebuiltTopBoxes.map((b) => b.bytes));
 }
 
 /**
