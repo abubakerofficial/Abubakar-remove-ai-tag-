@@ -7,6 +7,7 @@ export type CameraProfileId =
 
 export type CameraCategory = 'dslr' | 'mobile' | 'clean';
 export type VideoContainerFormat = 'mov' | 'mp4';
+export type VideoScrubMode = 'deep' | 'instant';
 
 export interface CameraProfile {
   id: CameraProfileId;
@@ -20,14 +21,32 @@ export interface CameraProfile {
   focalLength35mm: number;
   software: string;
   videoHandler: string;
+  audioHandler: string;
   colorProfile: string;
   badgeText: string;
 }
 
-export const DEFAULT_CAMERA_PROFILE_ID: CameraProfileId = 'sony_a7iv';
+export const DEFAULT_CAMERA_PROFILE_ID: CameraProfileId = 'iphone_16_pro';
 export const DEFAULT_VIDEO_CONTAINER: VideoContainerFormat = 'mov';
+export const DEFAULT_VIDEO_SCRUB_MODE: VideoScrubMode = 'deep';
 
 export const CAMERA_PROFILES: CameraProfile[] = [
+  {
+    id: 'iphone_16_pro',
+    category: 'mobile',
+    label: 'iPhone 16 Pro Max',
+    shortLabel: 'iPhone 16 Pro Max',
+    make: 'Apple',
+    model: 'iPhone 16 Pro Max',
+    lensMake: 'Apple',
+    lensModel: 'iPhone 16 Pro Max back triple camera 6.765mm f/1.78',
+    focalLength35mm: 24,
+    software: '18.2',
+    videoHandler: 'Core Media Video',
+    audioHandler: 'Core Media Audio',
+    colorProfile: 'Display P3 / Rec.709',
+    badgeText: 'Mobile Camera',
+  },
   {
     id: 'sony_a7iv',
     category: 'dslr',
@@ -40,6 +59,7 @@ export const CAMERA_PROFILES: CameraProfile[] = [
     focalLength35mm: 35,
     software: 'ILCE-7M4 v3.01',
     videoHandler: 'Sony XAVC-S Video Handler',
+    audioHandler: 'Sony Audio Handler',
     colorProfile: 'Rec.709 / sRGB',
     badgeText: 'DSLR Camera',
   },
@@ -55,23 +75,9 @@ export const CAMERA_PROFILES: CameraProfile[] = [
     focalLength35mm: 35,
     software: 'Firmware Version 2.0.0',
     videoHandler: 'Canon Cinema Video Handler',
+    audioHandler: 'Canon Audio Handler',
     colorProfile: 'Rec.709 / sRGB',
     badgeText: 'DSLR Camera',
-  },
-  {
-    id: 'iphone_16_pro',
-    category: 'mobile',
-    label: 'iPhone 16 Pro Max',
-    shortLabel: 'iPhone 16 Pro · Mobile',
-    make: 'Apple',
-    model: 'iPhone 16 Pro Max',
-    lensMake: 'Apple',
-    lensModel: 'iPhone 16 Pro Max back triple camera 6.765mm f/1.78',
-    focalLength35mm: 24,
-    software: '18.2',
-    videoHandler: 'Core Media Video',
-    colorProfile: 'Display P3 / Rec.709',
-    badgeText: 'Mobile Camera',
   },
   {
     id: 'samsung_s25_ultra',
@@ -85,6 +91,7 @@ export const CAMERA_PROFILES: CameraProfile[] = [
     focalLength35mm: 23,
     software: 'S938BXXU1AYB4',
     videoHandler: 'VideoHandle',
+    audioHandler: 'SoundHandle',
     colorProfile: 'Rec.709 / sRGB',
     badgeText: 'Mobile Camera',
   },
@@ -100,6 +107,7 @@ export const CAMERA_PROFILES: CameraProfile[] = [
     focalLength35mm: 0,
     software: '',
     videoHandler: '',
+    audioHandler: '',
     colorProfile: '',
     badgeText: 'Zero Metadata',
   },
@@ -515,6 +523,8 @@ export function buildFfmpegCameraMetadataArgs(
     `creation_time=${isoTime}`,
     '-metadata:s:v:0',
     `handler_name=${profile.videoHandler}`,
+    '-metadata:s:a:0',
+    `handler_name=${profile.audioHandler}`,
   ];
 
   if (isMov) {
@@ -523,3 +533,60 @@ export function buildFfmpegCameraMetadataArgs(
 
   return args;
 }
+
+/**
+ * Builds fast FFmpeg Deep TikTok Anti-AI Bypass arguments:
+ * - Drops all hidden timed metadata / C2PA / subtitle / data tracks (`-map 0:v:0 -map 0:a:0?`)
+ * - Removes all container metadata & chapters (`-map_metadata -1 -map_chapters -1`)
+ * - Re-encodes video with `-preset ultrafast -crf 19`, `-x264-params no-info=1`, and
+ *   `-bsf:v filter_units=remove_types=6` (zero H.264 SEI / x264 / C2PA / AIGC NAL units)
+ * - Applies imperceptible real-camera optical micro-crop + natural sensor micro-grain to
+ *   disrupt invisible pixel AI watermarks (Google SynthID / perceptual hashes)
+ * - Rebuilds clean 48 kHz AAC audio with gentle 24 Hz highpass to break audio watermarks
+ */
+export function buildFfmpegDeepBypassArgs(
+  profile: CameraProfile,
+  containerFormat: VideoContainerFormat = 'mov',
+  captureDate: Date = new Date()
+): string[] {
+  const cameraArgs = buildFfmpegCameraMetadataArgs(
+    profile,
+    containerFormat,
+    captureDate
+  );
+
+  return [
+    '-map',
+    '0:v:0',
+    '-map',
+    '0:a:0?',
+    '-map_metadata',
+    '-1',
+    '-map_chapters',
+    '-1',
+    '-vf',
+    'scale=trunc(iw*1.015/2)*2:trunc(ih*1.015/2)*2,crop=trunc(iw/1.015/2)*2:trunc(ih/1.015/2)*2,eq=contrast=1.006:saturation=1.01,noise=alls=2:allf=t',
+    '-c:v',
+    'libx264',
+    '-preset',
+    'ultrafast',
+    '-crf',
+    '19',
+    '-pix_fmt',
+    'yuv420p',
+    '-x264-params',
+    'no-info=1',
+    '-bsf:v',
+    'filter_units=remove_types=6',
+    '-c:a',
+    'aac',
+    '-b:a',
+    '192k',
+    '-ar',
+    '48000',
+    '-af',
+    'highpass=f=24',
+    ...cameraArgs,
+  ];
+}
+

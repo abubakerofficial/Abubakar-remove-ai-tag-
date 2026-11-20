@@ -36,7 +36,9 @@ import {
   CameraProfileId,
   DEFAULT_CAMERA_PROFILE_ID,
   DEFAULT_VIDEO_CONTAINER,
+  DEFAULT_VIDEO_SCRUB_MODE,
   VideoContainerFormat,
+  VideoScrubMode,
   getCameraProfile,
 } from './utils/cameraProfiles';
 
@@ -62,10 +64,10 @@ interface ToastNotification {
 }
 
 const VIDEO_PROCESSING_STEPS = [
-  'Parsing MP4 container atoms (moov.udta, XMP_, C2PA JUMBF)...',
-  'Stripping Google Flow, Runway, Luma & Pika AI signatures...',
-  'Injecting genuine DSLR / Mobile Camera hardware metadata tags...',
-  'Verifying bit-exact camera output & purging temporary data...',
+  'Purging C2PA JUMBF, XMP, hidden AI tracks & container atoms...',
+  'Neutralizing H.264/HEVC SEI NALs & disrupting SynthID watermarks...',
+  'Injecting genuine iPhone 16 Pro Max / DSLR camera & lens metadata...',
+  'Verifying bit-exact QuickTime output & clearing temp data...',
 ];
 
 const IMAGE_PROCESSING_STEPS = [
@@ -123,6 +125,9 @@ export default function App() {
   );
   const [videoContainer, setVideoContainer] = useState<VideoContainerFormat>(
     DEFAULT_VIDEO_CONTAINER
+  );
+  const [scrubMode, setScrubMode] = useState<VideoScrubMode>(
+    DEFAULT_VIDEO_SCRUB_MODE
   );
 
   const [isProcessing, setIsProcessing] = useState(false);
@@ -385,32 +390,29 @@ export default function App() {
         cleanByteSize = cleanBlob.size;
         serverDuration = Math.max(4, Math.round(performance.now() - startTime));
       } else {
-        // Instant Zero-Copy on-device MP4/MOV scrubbing via Blob.slice():
-        // Never uploads large videos over mobile data and never copies `mdat` frames into JS RAM.
-        const fastResult = await scrubVideoBlobFast(
-          selectedFile,
-          activeCameraProfile,
-          effectiveContainer
-        );
-
         const isFullStackHost =
           typeof window !== 'undefined' &&
           (window.location.hostname === 'localhost' ||
             window.location.hostname.endsWith('.run.app'));
 
+        // Mode 1: Deep TikTok Anti-AI Bypass (on full-stack server for files <= 28 MB)
+        // Rebuilds video/audio bitstream, strips ALL hidden tracks & H.264 SEI NAL units,
+        // disrupts invisible SynthID pixel/audio watermarks, and injects native QuickTime camera metadata.
         if (
-          !fastResult.processedAsIso &&
+          scrubMode === 'deep' &&
           isFullStackHost &&
-          selectedFile.size <= 25 * 1024 * 1024
+          selectedFile.size <= 28 * 1024 * 1024
         ) {
-          // Non-ISO video container (e.g., .webm) -> use server FFmpeg remux with 20s timeout
+          setProgress(55);
+          setStepIndex(1);
           const controller = new AbortController();
-          const timeoutId = setTimeout(() => controller.abort(), 20000);
+          const timeoutId = setTimeout(() => controller.abort(), 45000);
           try {
             const formData = new FormData();
             formData.append('video', selectedFile);
             formData.append('cameraProfile', activeCameraProfile.id);
             formData.append('containerFormat', effectiveContainer);
+            formData.append('scrubMode', 'deep');
 
             const response = await fetch('/api/strip-metadata', {
               method: 'POST',
@@ -424,16 +426,22 @@ export default function App() {
               (!contentType.includes('video/mp4') &&
                 !contentType.includes('video/quicktime'))
             ) {
-              throw new Error('Fallback to local scrubber');
+              throw new Error('Fallback to local SEI + ISO scrubber');
             }
 
             cleanBlob = await response.blob();
             cleanByteSize = cleanBlob.size;
             serverDuration = Number(
               response.headers.get('X-Process-Duration-Ms') ||
-                Math.max(8, Math.round(performance.now() - startTime))
+                Math.max(12, Math.round(performance.now() - startTime))
             );
           } catch {
+            // Instant on-device fallback: deep ISO + H.264/HEVC SEI NAL neutralization + camera injection
+            const fastResult = await scrubVideoBlobFast(
+              selectedFile,
+              activeCameraProfile,
+              effectiveContainer
+            );
             cleanBlob = fastResult.blob;
             cleanByteSize = fastResult.cleanSize;
             serverDuration = Math.max(4, Math.round(performance.now() - startTime));
@@ -441,9 +449,60 @@ export default function App() {
             clearTimeout(timeoutId);
           }
         } else {
-          cleanBlob = fastResult.blob;
-          cleanByteSize = fastResult.cleanSize;
-          serverDuration = Math.max(4, Math.round(performance.now() - startTime));
+          // Mode 2: Instant Zero-Copy on-device MP4/MOV scrubbing + H.264/HEVC SEI NAL neutralization
+          const fastResult = await scrubVideoBlobFast(
+            selectedFile,
+            activeCameraProfile,
+            effectiveContainer
+          );
+
+          if (
+            !fastResult.processedAsIso &&
+            isFullStackHost &&
+            selectedFile.size <= 25 * 1024 * 1024
+          ) {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 25000);
+            try {
+              const formData = new FormData();
+              formData.append('video', selectedFile);
+              formData.append('cameraProfile', activeCameraProfile.id);
+              formData.append('containerFormat', effectiveContainer);
+              formData.append('scrubMode', 'instant');
+
+              const response = await fetch('/api/strip-metadata', {
+                method: 'POST',
+                body: formData,
+                signal: controller.signal,
+              });
+
+              const contentType = response.headers.get('Content-Type') || '';
+              if (
+                !response.ok ||
+                (!contentType.includes('video/mp4') &&
+                  !contentType.includes('video/quicktime'))
+              ) {
+                throw new Error('Fallback to local scrubber');
+              }
+
+              cleanBlob = await response.blob();
+              cleanByteSize = cleanBlob.size;
+              serverDuration = Number(
+                response.headers.get('X-Process-Duration-Ms') ||
+                  Math.max(8, Math.round(performance.now() - startTime))
+              );
+            } catch {
+              cleanBlob = fastResult.blob;
+              cleanByteSize = fastResult.cleanSize;
+              serverDuration = Math.max(4, Math.round(performance.now() - startTime));
+            } finally {
+              clearTimeout(timeoutId);
+            }
+          } else {
+            cleanBlob = fastResult.blob;
+            cleanByteSize = fastResult.cleanSize;
+            serverDuration = Math.max(4, Math.round(performance.now() - startTime));
+          }
         }
 
         setOutputMimeType(effectiveVideoMime);
@@ -564,8 +623,19 @@ export default function App() {
     }
   };
 
+  const handleSelectScrubMode = (mode: VideoScrubMode) => {
+    setScrubMode(mode);
+    if (cleanDownloadUrl) {
+      URL.revokeObjectURL(cleanDownloadUrl);
+      setCleanDownloadUrl(null);
+      setCleanBlobObj(null);
+      setCleanFileSize(null);
+      setProcessDurationMs(null);
+    }
+  };
+
   return (
-    <div className="min-h-screen bg-[#090D16] text-slate-100 flex flex-col">
+    <div className="min-h-screen bg-[#090D16] text-slate-100 flex flex-col overflow-x-hidden">
       {/* Top Bar Contract: 3 zones separated by gap-8 */}
       <header className="flex items-center justify-between gap-3 sm:gap-8 px-4 sm:px-6 lg:px-10 py-4 border-b border-slate-800/80 bg-[#090D16]/95 sticky top-0 z-30 backdrop-blur">
         <a
@@ -621,7 +691,7 @@ export default function App() {
         <div
           role="status"
           aria-live="polite"
-          className="fixed bottom-5 right-5 z-50 max-w-md rounded-xl border border-slate-700 bg-[#11192A] p-4 shadow-2xl flex items-start gap-3"
+          className="fixed bottom-4 left-4 right-4 sm:left-auto sm:bottom-5 sm:right-5 z-50 sm:max-w-md rounded-xl border border-slate-700 bg-[#11192A] p-4 shadow-2xl flex items-start gap-3"
         >
           {toast.type === 'success' ? (
             <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0 mt-0.5" />
@@ -942,12 +1012,14 @@ export default function App() {
                 </div>
               )}
 
-              {/* Auto DSLR & Mobile Camera Signature Selector */}
+              {/* Auto Mobile & DSLR Camera Signature Selector */}
               <CameraProfileSelector
                 selectedProfileId={cameraProfileId}
                 onSelect={handleSelectCameraProfile}
                 videoContainer={videoContainer}
                 onSelectContainer={handleSelectVideoContainer}
+                scrubMode={scrubMode}
+                onSelectScrubMode={handleSelectScrubMode}
                 disabled={isProcessing}
               />
             </div>

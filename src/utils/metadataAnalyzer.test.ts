@@ -17,10 +17,12 @@ import {
   stripWebpMetadata,
 } from './metadataAnalyzer';
 import {
+  DEFAULT_CAMERA_PROFILE_ID,
   getCameraProfile,
   buildExifTiffPayload,
   buildMp4CameraMetaBox,
   buildFfmpegCameraMetadataArgs,
+  buildFfmpegDeepBypassArgs,
 } from './cameraProfiles';
 
 test('validateVideoFile accepts valid MP4 files and automatically renames to Abubakar Remove AI.mp4', () => {
@@ -545,5 +547,179 @@ test('inspectMediaBlobForAiMetadata reads head and tail slices of large Blobs wi
   assert.ok(platforms.includes('Google Flow'));
   assert.ok(platforms.includes('C2PA / EXIF'));
 });
+
+test('default camera profile is iPhone 16 Pro Max and Deep Bypass FFmpeg args strip tracks, SEI NALs, and watermarks', () => {
+  assert.equal(DEFAULT_CAMERA_PROFILE_ID, 'iphone_16_pro');
+  const def = getCameraProfile(DEFAULT_CAMERA_PROFILE_ID);
+  assert.equal(def.make, 'Apple');
+  assert.equal(def.model, 'iPhone 16 Pro Max');
+  assert.equal(def.videoHandler, 'Core Media Video');
+  assert.equal(def.audioHandler, 'Core Media Audio');
+
+  const deepArgs = buildFfmpegDeepBypassArgs(def, 'mov');
+  assert.ok(deepArgs.includes('0:v:0'));
+  assert.ok(deepArgs.includes('0:a:0?'));
+  assert.ok(deepArgs.includes('no-info=1'));
+  assert.ok(deepArgs.includes('filter_units=remove_types=6'));
+  assert.ok(deepArgs.includes('+bitexact'));
+});
+
+test('stripMp4MetadataInBrowser drops hidden non-A/V metadata tracks, wipes stsd Lavc compressorname, rewrites Google hdlr, and strips jumb/c2pa/free boxes', () => {
+  const makeBox = (type: string, payload: Uint8Array): Uint8Array => {
+    const size = 8 + payload.byteLength;
+    const out = new Uint8Array(size);
+    new DataView(out.buffer).setUint32(0, size, false);
+    for (let i = 0; i < 4; i++) out[4 + i] = type.charCodeAt(i);
+    out.set(payload, 8);
+    return out;
+  };
+  const concat = (arrs: Uint8Array[]) => {
+    const out = new Uint8Array(arrs.reduce((a, b) => a + b.byteLength, 0));
+    let p = 0;
+    for (const a of arrs) {
+      out.set(a, p);
+      p += a.byteLength;
+    }
+    return out;
+  };
+  const enc = new TextEncoder();
+
+  // Video track with Google hdlr and stsd containing "Lavc libx264" compressorname
+  const videHdlrPayload = concat([
+    new Uint8Array(8),
+    enc.encode('vide'),
+    new Uint8Array(12),
+    enc.encode('IsoMedia file produced by Google Inc.\0'),
+  ]);
+  const videHdlr = makeBox('hdlr', videHdlrPayload);
+
+  const avc1Entry = new Uint8Array(86);
+  new DataView(avc1Entry.buffer).setUint32(0, 86, false);
+  avc1Entry.set(enc.encode('avc1'), 4);
+  avc1Entry[50] = 12;
+  avc1Entry.set(enc.encode('Lavc libx264'), 51);
+  const stsdHeader = new Uint8Array(8);
+  new DataView(stsdHeader.buffer).setUint32(4, 1, false);
+  const stsd = makeBox('stsd', concat([stsdHeader, avc1Entry]));
+
+  const videTrak = makeBox('trak', makeBox('mdia', concat([videHdlr, makeBox('minf', makeBox('stbl', stsd))])));
+
+  // Hidden timed metadata track (hdlr = 'meta') carrying C2PA / AIGC claims
+  const metaHdlrPayload = concat([
+    new Uint8Array(8),
+    enc.encode('meta'),
+    new Uint8Array(12),
+    enc.encode('C2PA Timed Metadata AIGC\0'),
+  ]);
+  const hiddenMetaTrak = makeBox('trak', makeBox('mdia', makeBox('hdlr', metaHdlrPayload)));
+
+  const ftyp = makeBox('ftyp', enc.encode('isom0000isommp42'));
+  const jumb = makeBox('jumb', enc.encode('c2pa.jumbf.manifest AI_GENERATED'));
+  const freeBox = makeBox('free', enc.encode('Runway Gen-3 Hidden Free Box'));
+  const moov = makeBox('moov', concat([videTrak, hiddenMetaTrak]));
+  const mdat = makeBox('mdat', enc.encode('FRAME_BYTES'));
+
+  const out = stripMp4MetadataInBrowser(
+    concat([ftyp, jumb, freeBox, moov, mdat]),
+    getCameraProfile('iphone_16_pro'),
+    'mov'
+  );
+  const text = new TextDecoder('latin1').decode(out);
+
+  assert.equal(/IsoMedia|Google|Lavc|libx264|C2PA|AIGC|Runway|AI_GENERATED/i.test(text), false);
+  assert.ok(text.includes('Core Media Video'));
+  assert.ok(text.includes('iPhone 16 Pro Max'));
+  assert.ok(text.includes('FRAME_BYTES'));
+});
+
+test('scrubVideoBlobFast neutralizes H.264 SEI NAL units (x264 / c2pa / AIGC) inside mdat in-place while preserving IDR slice', async () => {
+  const makeBox = (type: string, payload: Uint8Array): Uint8Array => {
+    const size = 8 + payload.byteLength;
+    const out = new Uint8Array(size);
+    new DataView(out.buffer).setUint32(0, size, false);
+    for (let i = 0; i < 4; i++) out[4 + i] = type.charCodeAt(i);
+    out.set(payload, 8);
+    return out;
+  };
+  const concat = (arrs: Uint8Array[]) => {
+    const out = new Uint8Array(arrs.reduce((a, b) => a + b.byteLength, 0));
+    let p = 0;
+    for (const a of arrs) {
+      out.set(a, p);
+      p += a.byteLength;
+    }
+    return out;
+  };
+  const enc = new TextEncoder();
+
+  // Construct 1 video sample inside mdat containing:
+  // NAL 1: H.264 SEI (0x06) carrying "x264 c2pa.jumbf Google Veo AIGC"
+  // NAL 2: H.264 IDR slice (0x65) carrying "VALID_VIDEO_SLICE"
+  const seiPayload = concat([new Uint8Array([0x06, 0x05]), enc.encode('x264 c2pa.jumbf Google Veo AIGC')]);
+  const seiLen = new Uint8Array(4);
+  new DataView(seiLen.buffer).setUint32(0, seiPayload.byteLength, false);
+
+  const idrPayload = concat([new Uint8Array([0x65]), enc.encode('VALID_VIDEO_SLICE')]);
+  const idrLen = new Uint8Array(4);
+  new DataView(idrLen.buffer).setUint32(0, idrPayload.byteLength, false);
+
+  const sampleBytes = concat([seiLen, seiPayload, idrLen, idrPayload]);
+  const mdat = makeBox('mdat', sampleBytes);
+
+  const ftyp = makeBox('ftyp', enc.encode('isom0000isommp42'));
+  const videHdlr = makeBox('hdlr', concat([new Uint8Array(8), enc.encode('vide'), new Uint8Array(13)]));
+  const avc1Entry = new Uint8Array(86);
+  new DataView(avc1Entry.buffer).setUint32(0, 86, false);
+  avc1Entry.set(enc.encode('avc1'), 4);
+  const stsdHeader = new Uint8Array(8);
+  new DataView(stsdHeader.buffer).setUint32(4, 1, false);
+  const stsd = makeBox('stsd', concat([stsdHeader, avc1Entry]));
+
+  const stszPayload = new Uint8Array(16);
+  const stszView = new DataView(stszPayload.buffer);
+  stszView.setUint32(4, 0, false); // variable
+  stszView.setUint32(8, 1, false); // 1 sample
+  stszView.setUint32(12, sampleBytes.byteLength, false);
+  const stsz = makeBox('stsz', stszPayload);
+
+  const stscPayload = new Uint8Array(20);
+  const stscView = new DataView(stscPayload.buffer);
+  stscView.setUint32(4, 1, false);
+  stscView.setUint32(8, 1, false);
+  stscView.setUint32(12, 1, false);
+  stscView.setUint32(16, 1, false);
+  const stsc = makeBox('stsc', stscPayload);
+
+  const stcoPayload = new Uint8Array(12);
+  new DataView(stcoPayload.buffer).setUint32(4, 1, false);
+  // [ftyp, mdat, moov] => sample starts at ftyp.byteLength + 8
+  new DataView(stcoPayload.buffer).setUint32(8, ftyp.byteLength + 8, false);
+  const stco = makeBox('stco', stcoPayload);
+
+  const stbl = makeBox('stbl', concat([stsd, stsz, stsc, stco]));
+  const moov = makeBox('moov', makeBox('trak', makeBox('mdia', concat([videHdlr, makeBox('minf', stbl)]))));
+
+  const mp4 = concat([ftyp, mdat, moov]);
+  const res = await scrubVideoBlobFast(
+    new Blob([mp4 as unknown as BlobPart], { type: 'video/mp4' }),
+    getCameraProfile('iphone_16_pro'),
+    'mov'
+  );
+
+  assert.equal(res.processedAsIso, true);
+  const outBytes = new Uint8Array(await res.blob.arrayBuffer());
+  const outText = new TextDecoder('latin1').decode(outBytes);
+
+  // SEI AI strings must be 100% obliterated
+  assert.equal(/x264|c2pa|Google|Veo|AIGC/i.test(outText), false);
+  // IDR slice payload must be 100% preserved
+  assert.ok(outText.includes('VALID_VIDEO_SLICE'));
+  // First NAL inside mdat must now be H.264 Filler Data (0x0C ... 0x80)
+  const newMdatIdx = outText.indexOf('mdat');
+  const firstNalStart = newMdatIdx + 4 + 4; // skip 'mdat' + 4B nalLen
+  assert.equal(outBytes[firstNalStart], 0x0c);
+  assert.equal(outBytes[firstNalStart + seiPayload.byteLength - 1], 0x80);
+});
+
 
 

@@ -597,24 +597,101 @@ function parseChildBoxes(
   return offset === end ? boxes : [];
 }
 
-function isVideoTrakBox(trakData: Uint8Array, trakHeaderSize: number): boolean {
+function getTrakHandlerType(
+  trakData: Uint8Array,
+  trakHeaderSize: number
+): string | null {
   const trakChildren = parseChildBoxes(
     trakData,
     trakHeaderSize,
     trakData.byteLength
   );
   const mdia = trakChildren.find((b) => b.type === 'mdia');
-  if (!mdia) return false;
+  if (!mdia) return null;
   const mdiaChildren = parseChildBoxes(
     mdia.data,
     mdia.headerSize,
     mdia.data.byteLength
   );
   const hdlr = mdiaChildren.find((b) => b.type === 'hdlr');
-  if (!hdlr || hdlr.data.byteLength < hdlr.headerSize + 12) return false;
-  // hdlr FullBox: 4B version/flags + 4B pre_defined + 4B handler_type ('vide')
-  const subtype = readBoxType(hdlr.data, hdlr.headerSize + 8);
-  return subtype === 'vide';
+  if (!hdlr || hdlr.data.byteLength < hdlr.headerSize + 12) return null;
+  // hdlr FullBox: 4B version/flags + 4B pre_defined + 4B handler_type ('vide', 'soun', 'meta', etc.)
+  return readBoxType(hdlr.data, hdlr.headerSize + 8);
+}
+
+function isVideoTrakBox(trakData: Uint8Array, trakHeaderSize: number): boolean {
+  return getTrakHandlerType(trakData, trakHeaderSize) === 'vide';
+}
+
+function toQuickTimeEpochSeconds(date: Date): number {
+  // Seconds between 1904-01-01 and 1970-01-01 = 2,082,844,800
+  return Math.max(0, Math.floor(date.getTime() / 1000) + 2082844800);
+}
+
+function patchQtTimestampBox(
+  boxBytes: Uint8Array,
+  headerSize: number,
+  qtEpochSec: number
+) {
+  if (boxBytes.byteLength < headerSize + 12) return;
+  const version = boxBytes[headerSize];
+  const view = new DataView(
+    boxBytes.buffer,
+    boxBytes.byteOffset,
+    boxBytes.byteLength
+  );
+  if (version === 0 && boxBytes.byteLength >= headerSize + 12) {
+    view.setUint32(headerSize + 4, qtEpochSec >>> 0, false);
+    view.setUint32(headerSize + 8, qtEpochSec >>> 0, false);
+  } else if (version === 1 && boxBytes.byteLength >= headerSize + 20) {
+    const big = BigInt(qtEpochSec);
+    view.setBigUint64(headerSize + 4, big, false);
+    view.setBigUint64(headerSize + 12, big, false);
+  }
+}
+
+function sanitizeHdlrBox(
+  hdlrData: Uint8Array,
+  headerSize: number,
+  newHandlerName: string
+): Uint8Array {
+  if (hdlrData.byteLength < headerSize + 24) {
+    return new Uint8Array(hdlrData);
+  }
+  const enc = new TextEncoder();
+  const nameBytes = enc.encode(`${newHandlerName}\0`);
+  const payload = new Uint8Array(24 + nameBytes.byteLength);
+  // Preserve version/flags (4B) + component_type (4B) + handler_type (4B) + reserved (12B)
+  payload.set(hdlrData.subarray(headerSize, headerSize + 24), 0);
+  payload.set(nameBytes, 24);
+  return makeIsoBox('hdlr', payload);
+}
+
+function sanitizeStsdBox(
+  stsdData: Uint8Array,
+  headerSize: number
+): Uint8Array {
+  const out = new Uint8Array(stsdData);
+  if (out.byteLength < headerSize + 8) return out;
+
+  const view = new DataView(out.buffer, out.byteOffset, out.byteLength);
+  const entryCount = view.getUint32(headerSize + 4, false);
+  let pos = headerSize + 8;
+
+  const VISUAL_CODECS = new Set(['avc1', 'avc3', 'hvc1', 'hev1', 'mp4v', 'vp09', 'av01']);
+
+  for (let i = 0; i < entryCount && pos + 8 <= out.byteLength; i++) {
+    const entrySize = view.getUint32(pos, false);
+    if (entrySize < 8 || pos + entrySize > out.byteLength) break;
+    const fourCC = readBoxType(out, pos + 4);
+    if (VISUAL_CODECS.has(fourCC) && entrySize >= 86) {
+      // Wipe 32-byte compressorname Pascal string at offset +50..+81 (removes "Lavc libx264", "Google", etc.)
+      out.fill(0x00, pos + 50, pos + 82);
+    }
+    pos += entrySize;
+  }
+
+  return out;
 }
 
 function patchChunkOffsetsRecursive(
@@ -673,7 +750,322 @@ function patchChunkOffsetsRecursive(
   }
 }
 
-const ISO_STRIP_BOXES = new Set(['udta', 'meta', 'XMP_', 'ilst', 'uuid']);
+interface VideoSampleSpan {
+  fileOffset: number;
+  size: number;
+}
+
+interface VideoSeiScanPlan {
+  codec: 'avc' | 'hevc';
+  nalLengthSize: number;
+  samples: VideoSampleSpan[];
+}
+
+/**
+ * Extracts exact video sample byte spans and NAL length-prefix size from `moov`
+ * so H.264/HEVC SEI NAL units (`x264`, `c2pa`, `AIGC`, `Google Veo`, `Sora`, `Runway`)
+ * inside `mdat` can be neutralized in-place to spec-compliant Filler Data (`0x0C` / `0x4C`)
+ * without altering a single sample size or offset.
+ */
+function extractVideoSeiScanPlan(
+  moovData: Uint8Array,
+  moovHeaderSize: number
+): VideoSeiScanPlan | null {
+  const moovChildren = parseChildBoxes(
+    moovData,
+    moovHeaderSize,
+    moovData.byteLength
+  );
+
+  for (const child of moovChildren) {
+    if (child.type !== 'trak') continue;
+    if (!isVideoTrakBox(child.data, child.headerSize)) continue;
+
+    const trakChildren = parseChildBoxes(
+      child.data,
+      child.headerSize,
+      child.data.byteLength
+    );
+    const mdia = trakChildren.find((b) => b.type === 'mdia');
+    if (!mdia) continue;
+    const mdiaChildren = parseChildBoxes(
+      mdia.data,
+      mdia.headerSize,
+      mdia.data.byteLength
+    );
+    const minf = mdiaChildren.find((b) => b.type === 'minf');
+    if (!minf) continue;
+    const minfChildren = parseChildBoxes(
+      minf.data,
+      minf.headerSize,
+      minf.data.byteLength
+    );
+    const stbl = minfChildren.find((b) => b.type === 'stbl');
+    if (!stbl) continue;
+    const stblChildren = parseChildBoxes(
+      stbl.data,
+      stbl.headerSize,
+      stbl.data.byteLength
+    );
+
+    const stsd = stblChildren.find((b) => b.type === 'stsd');
+    const stsz = stblChildren.find((b) => b.type === 'stsz');
+    const stsc = stblChildren.find((b) => b.type === 'stsc');
+    const stco = stblChildren.find((b) => b.type === 'stco');
+    const co64 = stblChildren.find((b) => b.type === 'co64');
+
+    if (!stsd || !stsz || (!stco && !co64)) continue;
+
+    // 1. Detect AVC vs HEVC and nalLengthSize from stsd -> avc1/hvc1 -> avcC/hvcC
+    let codec: 'avc' | 'hevc' | null = null;
+    let nalLengthSize = 4;
+    if (stsd.data.byteLength >= stsd.headerSize + 16) {
+      const entryStart = stsd.headerSize + 8;
+      const entrySize = readUint32BE(stsd.data, entryStart);
+      const fourCC = readBoxType(stsd.data, entryStart + 4);
+      if (fourCC === 'avc1' || fourCC === 'avc3') {
+        codec = 'avc';
+      } else if (fourCC === 'hvc1' || fourCC === 'hev1') {
+        codec = 'hevc';
+      }
+      if (codec && entrySize > 86 && entryStart + entrySize <= stsd.data.byteLength) {
+        const entrySubBoxes = parseChildBoxes(
+          stsd.data,
+          entryStart + 86,
+          entryStart + entrySize
+        );
+        const avcC = entrySubBoxes.find((b) => b.type === 'avcC');
+        const hvcC = entrySubBoxes.find((b) => b.type === 'hvcC');
+        if (avcC && avcC.data.byteLength >= avcC.headerSize + 5) {
+          nalLengthSize = (avcC.data[avcC.headerSize + 4] & 0x03) + 1;
+        } else if (hvcC && hvcC.data.byteLength >= hvcC.headerSize + 22) {
+          nalLengthSize = (hvcC.data[hvcC.headerSize + 21] & 0x03) + 1;
+        }
+      }
+    }
+    if (!codec || (nalLengthSize !== 4 && nalLengthSize !== 2 && nalLengthSize !== 1)) {
+      continue;
+    }
+
+    // 2. Parse chunk offsets from stco / co64
+    const chunkOffsets: number[] = [];
+    if (stco && stco.data.byteLength >= stco.headerSize + 8) {
+      const v = new DataView(stco.data.buffer, stco.data.byteOffset, stco.data.byteLength);
+      const count = v.getUint32(stco.headerSize + 4, false);
+      let p = stco.headerSize + 8;
+      for (let i = 0; i < count && p + 4 <= stco.data.byteLength; i++) {
+        chunkOffsets.push(v.getUint32(p, false));
+        p += 4;
+      }
+    } else if (co64 && co64.data.byteLength >= co64.headerSize + 8) {
+      const v = new DataView(co64.data.buffer, co64.data.byteOffset, co64.data.byteLength);
+      const count = v.getUint32(co64.headerSize + 4, false);
+      let p = co64.headerSize + 8;
+      for (let i = 0; i < count && p + 8 <= co64.data.byteLength; i++) {
+        chunkOffsets.push(Number(v.getBigUint64(p, false)));
+        p += 8;
+      }
+    }
+    if (chunkOffsets.length === 0) continue;
+
+    // 3. Parse sample sizes from stsz
+    if (stsz.data.byteLength < stsz.headerSize + 12) continue;
+    const stszView = new DataView(
+      stsz.data.buffer,
+      stsz.data.byteOffset,
+      stsz.data.byteLength
+    );
+    const defaultSize = stszView.getUint32(stsz.headerSize + 4, false);
+    const sampleCount = stszView.getUint32(stsz.headerSize + 8, false);
+    const sampleSizes: number[] = [];
+    if (defaultSize > 0) {
+      for (let i = 0; i < sampleCount; i++) sampleSizes.push(defaultSize);
+    } else {
+      let p = stsz.headerSize + 12;
+      for (let i = 0; i < sampleCount && p + 4 <= stsz.data.byteLength; i++) {
+        sampleSizes.push(stszView.getUint32(p, false));
+        p += 4;
+      }
+    }
+
+    // 4. Parse stsc (samples per chunk runs)
+    const stscEntries: Array<{ firstChunk: number; samplesPerChunk: number }> = [];
+    if (stsc && stsc.data.byteLength >= stsc.headerSize + 8) {
+      const v = new DataView(stsc.data.buffer, stsc.data.byteOffset, stsc.data.byteLength);
+      const count = v.getUint32(stsc.headerSize + 4, false);
+      let p = stsc.headerSize + 8;
+      for (let i = 0; i < count && p + 12 <= stsc.data.byteLength; i++) {
+        stscEntries.push({
+          firstChunk: v.getUint32(p, false),
+          samplesPerChunk: v.getUint32(p + 4, false),
+        });
+        p += 12;
+      }
+    }
+
+    // 5. Compute exact (fileOffset, size) for each video sample
+    const samples: VideoSampleSpan[] = [];
+    let sampleIdx = 0;
+    let stscIdx = 0;
+    for (let c = 0; c < chunkOffsets.length && sampleIdx < sampleSizes.length; c++) {
+      const chunkNum = c + 1;
+      while (
+        stscIdx + 1 < stscEntries.length &&
+        stscEntries[stscIdx + 1].firstChunk <= chunkNum
+      ) {
+        stscIdx++;
+      }
+      const spc =
+        stscEntries.length > 0 ? stscEntries[stscIdx].samplesPerChunk : 1;
+      let cursor = chunkOffsets[c];
+      for (let k = 0; k < spc && sampleIdx < sampleSizes.length; k++) {
+        const sSize = sampleSizes[sampleIdx++];
+        samples.push({ fileOffset: cursor, size: sSize });
+        cursor += sSize;
+      }
+    }
+
+    return { codec, nalLengthSize, samples };
+  }
+
+  return null;
+}
+
+/**
+ * Neutralizes every H.264 SEI (type 6) and HEVC PREFIX/SUFFIX SEI (types 39/40)
+ * NAL unit inside a slice of `mdat` in-place by rewriting it into a spec-compliant
+ * Filler Data NAL unit (`0x0C` for H.264, `0x4C 0x01` for HEVC) of the EXACT same length.
+ * Eradicates hidden `x264`, `c2pa`, `AIGC`, `Google Veo`, `Sora`, `Runway`, and `Kling`
+ * bitstream tags with zero quality loss and zero sample offset changes.
+ */
+function neutralizeSeiInMdatSlice(
+  sliceBytes: Uint8Array,
+  sliceFileStart: number,
+  plan: VideoSeiScanPlan
+): number {
+  const sliceFileEnd = sliceFileStart + sliceBytes.byteLength;
+  let neutralizedCount = 0;
+
+  for (const sample of plan.samples) {
+    const sStart = sample.fileOffset;
+    const sEnd = sStart + sample.size;
+    if (sStart < sliceFileStart || sEnd > sliceFileEnd) continue;
+
+    let pos = sStart - sliceFileStart;
+    const end = sEnd - sliceFileStart;
+
+    while (pos + plan.nalLengthSize < end) {
+      let nalLen = 0;
+      if (plan.nalLengthSize === 4) {
+        nalLen = readUint32BE(sliceBytes, pos);
+      } else if (plan.nalLengthSize === 2) {
+        nalLen = (sliceBytes[pos] << 8) | sliceBytes[pos + 1];
+      } else {
+        nalLen = sliceBytes[pos];
+      }
+      pos += plan.nalLengthSize;
+      if (nalLen <= 0 || pos + nalLen > end) break;
+
+      const headerByte = sliceBytes[pos];
+      if (plan.codec === 'avc' && (headerByte & 0x1f) === 6 && nalLen >= 2) {
+        // H.264 Filler Data NAL (nal_unit_type = 12 = 0x0C, payload 0xFF..., rbsp_trailing_bits 0x80)
+        sliceBytes[pos] = 0x0c;
+        if (nalLen > 2) {
+          sliceBytes.fill(0xff, pos + 1, pos + nalLen - 1);
+        }
+        sliceBytes[pos + nalLen - 1] = 0x80;
+        neutralizedCount++;
+      } else if (plan.codec === 'hevc' && nalLen >= 3) {
+        const hevcType = (headerByte >>> 1) & 0x3f;
+        if (hevcType === 39 || hevcType === 40) {
+          // HEVC Filler Data NAL (FD_NUT = 38 => (38 << 1) = 0x4C, temporal_id_plus1 = 0x01)
+          sliceBytes[pos] = 0x4c;
+          sliceBytes[pos + 1] = 0x01;
+          if (nalLen > 3) {
+            sliceBytes.fill(0xff, pos + 2, pos + nalLen - 1);
+          }
+          sliceBytes[pos + nalLen - 1] = 0x80;
+          neutralizedCount++;
+        }
+      }
+
+      pos += nalLen;
+    }
+  }
+
+  return neutralizedCount;
+}
+
+const ISO_STRIP_BOXES = new Set([
+  'udta',
+  'meta',
+  'XMP_',
+  'ilst',
+  'uuid',
+  'jumb',
+  'c2pa',
+  'free',
+  'skip',
+  'pnot',
+  'junk',
+  'tref',
+]);
+
+function sanitizeSubContainer(
+  boxData: Uint8Array,
+  boxHeaderSize: number,
+  boxType: string,
+  cameraProfile: CameraProfile | undefined,
+  qtEpochSec: number,
+  trakHandlerType: string | null
+): Uint8Array {
+  const children = parseChildBoxes(boxData, boxHeaderSize, boxData.byteLength);
+  if (children.length === 0) {
+    return new Uint8Array(boxData);
+  }
+
+  const outChildren: Uint8Array[] = [];
+  for (const child of children) {
+    if (ISO_STRIP_BOXES.has(child.type)) {
+      continue;
+    }
+
+    if (child.type === 'mdia' || child.type === 'minf' || child.type === 'stbl' || child.type === 'edts') {
+      outChildren.push(
+        sanitizeSubContainer(
+          child.data,
+          child.headerSize,
+          child.type,
+          cameraProfile,
+          qtEpochSec,
+          trakHandlerType
+        )
+      );
+    } else if (child.type === 'mdhd' || child.type === 'tkhd') {
+      const copy = new Uint8Array(child.data);
+      patchQtTimestampBox(copy, child.headerSize, qtEpochSec);
+      outChildren.push(copy);
+    } else if (child.type === 'hdlr' && boxType === 'mdia') {
+      const cleanName =
+        trakHandlerType === 'vide'
+          ? cameraProfile && cameraProfile.id !== 'none'
+            ? cameraProfile.videoHandler
+            : 'VideoHandler'
+          : trakHandlerType === 'soun'
+            ? cameraProfile && cameraProfile.id !== 'none'
+              ? cameraProfile.audioHandler
+              : 'SoundHandler'
+            : 'Handler';
+      outChildren.push(sanitizeHdlrBox(child.data, child.headerSize, cleanName));
+    } else if (child.type === 'stsd') {
+      outChildren.push(sanitizeStsdBox(child.data, child.headerSize));
+    } else {
+      outChildren.push(new Uint8Array(child.data));
+    }
+  }
+
+  return makeIsoBox(boxType, concatUint8Arrays(outChildren));
+}
 
 function rebuildMoovBox(
   moovData: Uint8Array,
@@ -683,6 +1075,7 @@ function rebuildMoovBox(
   captureDate: Date
 ): Uint8Array {
   const injectCamera = Boolean(cameraProfile && cameraProfile.id !== 'none');
+  const qtEpochSec = toQuickTimeEpochSeconds(captureDate);
   const moovChildren = parseChildBoxes(
     moovData,
     moovHeaderSize,
@@ -702,7 +1095,20 @@ function rebuildMoovBox(
       continue;
     }
 
+    if (child.type === 'mvhd') {
+      const copy = new Uint8Array(child.data);
+      patchQtTimestampBox(copy, child.headerSize, qtEpochSec);
+      newMoovChildren.push(copy);
+      continue;
+    }
+
     if (child.type === 'trak') {
+      const handlerType = getTrakHandlerType(child.data, child.headerSize);
+      // Drop ALL non-audio/video tracks (hidden C2PA / AIGC / timed metadata / tmcd / text tracks)
+      if (handlerType && handlerType !== 'vide' && handlerType !== 'soun') {
+        continue;
+      }
+
       const trakChildren = parseChildBoxes(
         child.data,
         child.headerSize,
@@ -711,15 +1117,29 @@ function rebuildMoovBox(
       if (trakChildren.length > 0) {
         const cleanTrakChildren: Uint8Array[] = [];
         for (const tc of trakChildren) {
-          if (!ISO_STRIP_BOXES.has(tc.type)) {
+          if (ISO_STRIP_BOXES.has(tc.type)) {
+            continue;
+          }
+          if (tc.type === 'tkhd') {
+            const copy = new Uint8Array(tc.data);
+            patchQtTimestampBox(copy, tc.headerSize, qtEpochSec);
+            cleanTrakChildren.push(copy);
+          } else if (tc.type === 'mdia' || tc.type === 'edts') {
+            cleanTrakChildren.push(
+              sanitizeSubContainer(
+                tc.data,
+                tc.headerSize,
+                tc.type,
+                cameraProfile,
+                qtEpochSec,
+                handlerType
+              )
+            );
+          } else {
             cleanTrakChildren.push(new Uint8Array(tc.data));
           }
         }
-        if (
-          injectCamera &&
-          cameraProfile &&
-          isVideoTrakBox(child.data, child.headerSize)
-        ) {
+        if (injectCamera && cameraProfile && handlerType === 'vide') {
           const trakMeta = buildMp4CameraMetaBox(cameraProfile, captureDate, {
             isQuickTimeAtom: isMov,
             trackOnly: true,
@@ -760,11 +1180,10 @@ function rebuildMoovBox(
 }
 
 /**
- * Losslessly scrubs MP4/MOV metadata boxes (`udta`, `meta`, `XMP_`, C2PA `uuid`, `ilst`)
- * and rebuilds `moov` cleanly so native Apple QuickTime `moov.meta` (direct child of `moov`),
- * video track `moov.trak[vide].meta` (lens_model & focal_length_35mm), and `moov.udta`
- * (`©mak`/`©mod`/`©swr`/`©day`) are embedded with exact `stco`/`co64` chunk offset patching.
- * Works identically in Node.js and in-browser (Vercel / InfinityFree) with zero re-encoding.
+ * Losslessly scrubs MP4/MOV metadata boxes (`udta`, `meta`, `XMP_`, C2PA `uuid`, `jumb`, `c2pa`, `free`, `skip`, `ilst`),
+ * drops hidden non-A/V metadata tracks, rewrites `mdia.hdlr` & `stsd` compressor names, updates `mvhd`/`tkhd`/`mdhd`
+ * timestamps, neutralizes H.264/HEVC SEI NAL units inside `mdat` in-place, and injects native Apple QuickTime
+ * `moov.meta` + video `trak.meta` + `moov.udta` with exact `stco`/`co64` chunk offset patching.
  */
 export function stripMp4MetadataInBrowser(
   input: Uint8Array,
@@ -772,10 +1191,10 @@ export function stripMp4MetadataInBrowser(
   containerFormat: VideoContainerFormat = 'mov'
 ): Uint8Array {
   const topBoxes = parseChildBoxes(input, 0, input.byteLength);
-  const hasRealMoov = topBoxes.some((b) => b.type === 'moov');
+  const moovBox = topBoxes.find((b) => b.type === 'moov');
 
   // Fallback path for synthetic flat test buffers without valid ISO box headers
-  if (!hasRealMoov) {
+  if (!moovBox) {
     const output = new Uint8Array(input.byteLength);
     output.set(input);
     const walked = walkAndScrubMp4Boxes(output, 0, output.byteLength, 0);
@@ -799,6 +1218,7 @@ export function stripMp4MetadataInBrowser(
   const injectCamera = Boolean(cameraProfile && cameraProfile.id !== 'none');
   const isMov = injectCamera && containerFormat === 'mov';
   const captureDate = new Date();
+  const seiPlan = extractVideoSeiScanPlan(moovBox.data, moovBox.headerSize);
 
   const oldMdatBox = topBoxes.find((b) => b.type === 'mdat');
   const oldMdatStart = oldMdatBox ? oldMdatBox.start : -1;
@@ -830,7 +1250,14 @@ export function stripMp4MetadataInBrowser(
       continue;
     }
 
-    // Preserve `mdat`, `wide`, `free`, etc. untouched (zero re-encoding)
+    if (box.type === 'mdat' && seiPlan && seiPlan.samples.length > 0) {
+      const mdatCopy = new Uint8Array(box.data);
+      neutralizeSeiInMdatSlice(mdatCopy, box.start, seiPlan);
+      rebuiltTopBoxes.push({ type: 'mdat', bytes: mdatCopy });
+      continue;
+    }
+
+    // Preserve `mdat`, `wide`, etc. untouched (zero re-encoding)
     rebuiltTopBoxes.push({ type: box.type, bytes: box.data });
   }
 
@@ -875,10 +1302,10 @@ export interface FastVideoScrubResult {
 }
 
 /**
- * Zero-copy ultra-fast MP4/MOV video scrubber using Blob.slice().
- * Reads ONLY tiny 16-byte box headers plus `ftyp` and `moov` (~20–500 KB) into RAM.
- * NEVER loads `mdat` video/audio frames into JavaScript memory — completes in < 50 ms
- * even on 100–500 MB videos without freezing mobile browsers or waiting on network uploads.
+ * Zero-copy ultra-fast MP4/MOV video scrubber using Blob.slice() + surgical H.264/HEVC SEI NAL
+ * neutralization. Strips all metadata/C2PA/jumb/free/skip boxes, hidden non-A/V tracks, `hdlr`
+ * & `stsd` encoder strings, neutralizes SEI NAL units in-place without changing sample offsets,
+ * promotes `moov` to faststart, and embeds genuine QuickTime camera & lens hardware tags.
  */
 export async function scrubVideoBlobFast(
   file: Blob,
@@ -940,10 +1367,10 @@ export async function scrubVideoBlobFast(
     offset += boxSize;
   }
 
-  const hasMoov = topBoxes.some((b) => b.type === 'moov');
-  const isCleanIso = validTree && hasMoov && offset === file.size;
+  const moovTopBox = topBoxes.find((b) => b.type === 'moov');
+  const isCleanIso = validTree && Boolean(moovTopBox) && offset === file.size;
 
-  if (!isCleanIso) {
+  if (!isCleanIso || !moovTopBox) {
     // Small synthetic or non-standard buffer fallback (e.g., offline sample MP4)
     if (file.size <= 8 * 1024 * 1024) {
       const rawBytes = new Uint8Array(await file.arrayBuffer());
@@ -970,6 +1397,18 @@ export async function scrubVideoBlobFast(
   }
 
   const captureDate = new Date();
+  const moovRaw = new Uint8Array(
+    await file.slice(moovTopBox.start, moovTopBox.end).arrayBuffer()
+  );
+  const seiPlan = extractVideoSeiScanPlan(moovRaw, moovTopBox.headerSize);
+  const newMoovBytes = rebuildMoovBox(
+    moovRaw,
+    moovTopBox.headerSize,
+    cameraProfile,
+    isMov,
+    captureDate
+  );
+
   const mdatIndices = topBoxes
     .map((b, idx) => (b.type === 'mdat' ? idx : -1))
     .filter((idx) => idx >= 0);
@@ -986,7 +1425,11 @@ export async function scrubVideoBlobFast(
   };
 
   const parts: OutputPart[] = [];
-  let rebuiltMoovPart: OutputPart | null = null;
+  const moovPart: OutputPart = {
+    type: 'moov',
+    size: newMoovBytes.byteLength,
+    bytes: newMoovBytes,
+  };
 
   for (let i = 0; i < topBoxes.length; i++) {
     const box = topBoxes[i];
@@ -994,7 +1437,6 @@ export async function scrubVideoBlobFast(
       firstMdatIdx >= 0 && i > firstMdatIdx && i < lastMdatIdx;
 
     if (ISO_STRIP_BOXES.has(box.type)) {
-      // Preserve exact spacing between multiple mdat boxes if a metadata box sits between them
       if (isBetweenMdats) {
         const freeZero = new Uint8Array(box.size);
         const view = new DataView(freeZero.buffer);
@@ -1017,24 +1459,6 @@ export async function scrubVideoBlobFast(
     }
 
     if (box.type === 'moov') {
-      const moovRaw = new Uint8Array(
-        await file.slice(box.start, box.end).arrayBuffer()
-      );
-      const newMoovBytes = rebuildMoovBox(
-        moovRaw,
-        box.headerSize,
-        cameraProfile,
-        isMov,
-        captureDate
-      );
-      const moovPart: OutputPart = {
-        type: 'moov',
-        size: newMoovBytes.byteLength,
-        bytes: newMoovBytes,
-      };
-      rebuiltMoovPart = moovPart;
-      // Place `moov` right after `ftyp` (native faststart) if there is a single mdat
-      // or moov is not sandwiched between two mdat boxes
       if (!isBetweenMdats && mdatIndices.length <= 1) {
         const ftypIdx = parts.findIndex((p) => p.type === 'ftyp');
         if (ftypIdx >= 0) {
@@ -1048,7 +1472,46 @@ export async function scrubVideoBlobFast(
       continue;
     }
 
-    // Zero-copy OS-backed Blob slice for `mdat`, `wide`, `free`, etc. (0 RAM copied!)
+    if (box.type === 'mdat' && seiPlan && seiPlan.samples.length > 0) {
+      const MAX_FULL_SEI_SCAN = 32 * 1024 * 1024; // 32 MB full SEI scan
+      if (box.size <= MAX_FULL_SEI_SCAN) {
+        const mdatBytes = new Uint8Array(
+          await file.slice(box.start, box.end).arrayBuffer()
+        );
+        neutralizeSeiInMdatSlice(mdatBytes, box.start, seiPlan);
+        parts.push({
+          type: 'mdat',
+          size: mdatBytes.byteLength,
+          bytes: mdatBytes,
+        });
+      } else {
+        // Huge > 32 MB video: scrub SEI in first 3 MB + last 1 MB, keep middle zero-copy!
+        const headLen = 3 * 1024 * 1024;
+        const tailLen = 1 * 1024 * 1024;
+        const headEnd = box.start + headLen;
+        const tailStart = box.end - tailLen;
+
+        const [headBuf, tailBuf] = await Promise.all([
+          file.slice(box.start, headEnd).arrayBuffer(),
+          file.slice(tailStart, box.end).arrayBuffer(),
+        ]);
+        const headBytes = new Uint8Array(headBuf);
+        const tailBytes = new Uint8Array(tailBuf);
+        neutralizeSeiInMdatSlice(headBytes, box.start, seiPlan);
+        neutralizeSeiInMdatSlice(tailBytes, tailStart, seiPlan);
+
+        parts.push({ type: 'mdat', size: headBytes.byteLength, bytes: headBytes });
+        parts.push({
+          type: 'mdat_mid',
+          size: tailStart - headEnd,
+          slice: file.slice(headEnd, tailStart),
+        });
+        parts.push({ type: 'mdat_tail', size: tailBytes.byteLength, bytes: tailBytes });
+      }
+      continue;
+    }
+
+    // Zero-copy OS-backed Blob slice for `mdat` (when non-AVC/HEVC), `wide`, etc.
     parts.push({
       type: box.type,
       size: box.size,
@@ -1057,7 +1520,7 @@ export async function scrubVideoBlobFast(
   }
 
   // Patch every `stco` / `co64` offset inside `moov` by exact `newMdatStart - oldMdatStart`
-  if (oldMdatStart >= 0 && rebuiltMoovPart?.bytes) {
+  if (oldMdatStart >= 0 && moovPart.bytes) {
     let newMdatStart = 0;
     for (const part of parts) {
       if (part.type === 'mdat') break;
@@ -1066,9 +1529,9 @@ export async function scrubVideoBlobFast(
     const delta = newMdatStart - oldMdatStart;
     if (delta !== 0) {
       patchChunkOffsetsRecursive(
-        rebuiltMoovPart.bytes,
+        moovPart.bytes,
         8,
-        rebuiltMoovPart.bytes.byteLength,
+        moovPart.bytes.byteLength,
         delta
       );
     }

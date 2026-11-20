@@ -5,6 +5,7 @@ import {
   CameraProfile,
   CameraProfileId,
   VideoContainerFormat,
+  VideoScrubMode,
 } from '../utils/cameraProfiles';
 
 interface CameraProfileSelectorProps {
@@ -12,6 +13,8 @@ interface CameraProfileSelectorProps {
   onSelect: (id: CameraProfileId) => void;
   videoContainer: VideoContainerFormat;
   onSelectContainer: (fmt: VideoContainerFormat) => void;
+  scrubMode: VideoScrubMode;
+  onSelectScrubMode: (mode: VideoScrubMode) => void;
   disabled?: boolean;
 }
 
@@ -20,6 +23,8 @@ export const CameraProfileSelector: React.FC<CameraProfileSelectorProps> = ({
   onSelect,
   videoContainer,
   onSelectContainer,
+  scrubMode,
+  onSelectScrubMode,
   disabled = false,
 }) => {
   const activeProfile: CameraProfile =
@@ -37,18 +42,18 @@ export const CameraProfileSelector: React.FC<CameraProfileSelectorProps> = ({
             <Camera className="w-4 h-4 text-emerald-400 shrink-0" />
           )}
           <h2 className="text-sm font-semibold text-slate-100 font-display">
-            Auto DSLR &amp; Mobile Camera Signature
+            Auto Mobile &amp; DSLR Camera Signature
           </h2>
         </div>
         <span className="font-mono text-[11px] text-emerald-400">
           {activeProfile.category === 'clean'
             ? 'Strip Only'
-            : `Auto-Inject: ${activeProfile.badgeText}`}
+            : `Auto-Inject: ${activeProfile.shortLabel}`}
         </span>
       </div>
 
       <p className="text-xs text-slate-400 leading-relaxed">
-        Replaces <span className="text-slate-200">&ldquo;No camera information&rdquo;</span> &amp; <span className="text-slate-200">&ldquo;No lens information&rdquo;</span> in iPhone Photos, Android, TikTok &amp; YouTube with genuine QuickTime camera &amp; lens hardware metadata.
+        Strips hidden C2PA, H.264/HEVC SEI NALs, timed AI tracks &amp; watermarks, then injects genuine <span className="text-slate-200">{activeProfile.id === 'none' ? 'zero-metadata' : activeProfile.label}</span> hardware &amp; lens tags so iPhone Photos &amp; TikTok detect real camera footage.
       </p>
 
       <div
@@ -108,17 +113,50 @@ export const CameraProfileSelector: React.FC<CameraProfileSelectorProps> = ({
         })}
       </div>
 
+      {/* Anti-AI Scrubbing Engine Mode */}
+      <div className="pt-2 border-t border-slate-800/80 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs">
+        <span className="text-slate-400">
+          TikTok Anti-AI Engine:
+        </span>
+        <div className="flex flex-wrap items-center gap-1 p-1 rounded-lg bg-[#090D16] border border-slate-800">
+          <button
+            type="button"
+            disabled={disabled}
+            onClick={() => onSelectScrubMode('deep')}
+            className={`px-2.5 py-1 text-[11px] font-medium rounded-md transition-colors cursor-pointer disabled:opacity-50 ${
+              scrubMode === 'deep'
+                ? 'bg-emerald-400 text-slate-950 font-semibold'
+                : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            Deep TikTok Bypass (Watermark + SEI + C2PA)
+          </button>
+          <button
+            type="button"
+            disabled={disabled}
+            onClick={() => onSelectScrubMode('instant')}
+            className={`px-2.5 py-1 text-[11px] font-medium rounded-md transition-colors cursor-pointer disabled:opacity-50 ${
+              scrubMode === 'instant'
+                ? 'bg-emerald-400 text-slate-950 font-semibold'
+                : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            Instant Zero-Copy (SEI + C2PA)
+          </button>
+        </div>
+      </div>
+
       {activeProfile.id !== 'none' && (
-        <div className="pt-1 border-t border-slate-800/80 flex flex-wrap items-center justify-between gap-2.5 text-xs">
+        <div className="pt-2 border-t border-slate-800/80 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs">
           <span className="text-slate-400">
             Video Container Format:
           </span>
-          <div className="flex items-center gap-1 p-1 rounded-lg bg-[#090D16] border border-slate-800">
+          <div className="flex flex-wrap items-center gap-1 p-1 rounded-lg bg-[#090D16] border border-slate-800">
             <button
               type="button"
               disabled={disabled}
               onClick={() => onSelectContainer('mov')}
-              className={`px-2.5 py-1 text-[11px] font-medium rounded-md transition-colors whitespace-nowrap cursor-pointer disabled:opacity-50 ${
+              className={`px-2.5 py-1 text-[11px] font-medium rounded-md transition-colors cursor-pointer disabled:opacity-50 ${
                 videoContainer === 'mov'
                   ? 'bg-emerald-400 text-slate-950 font-semibold'
                   : 'text-slate-400 hover:text-slate-200'
@@ -130,7 +168,7 @@ export const CameraProfileSelector: React.FC<CameraProfileSelectorProps> = ({
               type="button"
               disabled={disabled}
               onClick={() => onSelectContainer('mp4')}
-              className={`px-2.5 py-1 text-[11px] font-medium rounded-md transition-colors whitespace-nowrap cursor-pointer disabled:opacity-50 ${
+              className={`px-2.5 py-1 text-[11px] font-medium rounded-md transition-colors cursor-pointer disabled:opacity-50 ${
                 videoContainer === 'mp4'
                   ? 'bg-emerald-400 text-slate-950 font-semibold'
                   : 'text-slate-400 hover:text-slate-200'

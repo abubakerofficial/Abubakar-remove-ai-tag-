@@ -9,9 +9,12 @@ import { createServer as createViteServer } from 'vite';
 import {
   DEFAULT_CAMERA_PROFILE_ID,
   DEFAULT_VIDEO_CONTAINER,
+  DEFAULT_VIDEO_SCRUB_MODE,
   VideoContainerFormat,
+  VideoScrubMode,
   getCameraProfile,
   buildFfmpegCameraMetadataArgs,
+  buildFfmpegDeepBypassArgs,
 } from './src/utils/cameraProfiles';
 import { stripMp4MetadataInBrowser } from './src/utils/metadataAnalyzer';
 
@@ -164,6 +167,8 @@ async function startServer() {
         : req.body?.containerFormat === 'mov'
           ? 'mov'
           : DEFAULT_VIDEO_CONTAINER;
+    const scrubMode: VideoScrubMode =
+      req.body?.scrubMode === 'instant' ? 'instant' : DEFAULT_VIDEO_SCRUB_MODE;
     const effectiveFormat: VideoContainerFormat =
       cameraProfile.id === 'none' ? 'mp4' : requestedContainer;
     const isMov = effectiveFormat === 'mov';
@@ -180,11 +185,32 @@ async function startServer() {
       cameraProfile,
       effectiveFormat
     );
+    const deepBypassArgs = buildFfmpegDeepBypassArgs(
+      cameraProfile,
+      effectiveFormat
+    );
+
+    const runFfmpegPass = (options: string[]) =>
+      new Promise<void>((resolve, reject) => {
+        ffmpeg(inputPath)
+          .outputOptions(options)
+          .output(outputPath)
+          .on('end', () => resolve())
+          .on('error', (err) => reject(err))
+          .run();
+      });
 
     try {
-      await new Promise<void>((resolve, reject) => {
-        ffmpeg(inputPath)
-          .outputOptions([
+      if (scrubMode === 'deep') {
+        try {
+          await runFfmpegPass(deepBypassArgs);
+        } catch {
+          // If input has unusual codec/filter incompatibility, fallback to lossless stream copy + SEI scrub
+          await runFfmpegPass([
+            '-map',
+            '0:v:0',
+            '-map',
+            '0:a:0?',
             '-map_metadata',
             '-1',
             '-map_chapters',
@@ -194,12 +220,25 @@ async function startServer() {
             '-c:a',
             'copy',
             ...cameraFfmpegArgs,
-          ])
-          .output(outputPath)
-          .on('end', () => resolve())
-          .on('error', (err) => reject(err))
-          .run();
-      });
+          ]);
+        }
+      } else {
+        await runFfmpegPass([
+          '-map',
+          '0:v:0',
+          '-map',
+          '0:a:0?',
+          '-map_metadata',
+          '-1',
+          '-map_chapters',
+          '-1',
+          '-c:v',
+          'copy',
+          '-c:a',
+          'copy',
+          ...cameraFfmpegArgs,
+        ]);
+      }
 
       const [inStat, ffmpegOutBuffer] = await Promise.all([
         fs.promises.stat(inputPath),
@@ -207,7 +246,8 @@ async function startServer() {
       ]);
 
       // Apply exact Apple QuickTime `moov.meta` (direct child of `moov`), video track
-      // `moov.trak[vide].meta` (LensModel + FocalLength), `moov.udta`, and `stco`/`co64` patching
+      // `moov.trak[vide].meta` (LensModel + FocalLength), `moov.udta`, wipe `stsd` Lavc strings,
+      // neutralize any residual SEI NAL units, rewrite `hdlr`, and patch `stco`/`co64`
       const finalUint8 = stripMp4MetadataInBrowser(
         new Uint8Array(ffmpegOutBuffer),
         cameraProfile,
@@ -230,9 +270,10 @@ async function startServer() {
       res.setHeader('X-Process-Duration-Ms', String(durationMs));
       res.setHeader('X-Clean-Filename', downloadFileName);
       res.setHeader('X-Camera-Profile', cameraProfile.id);
+      res.setHeader('X-Scrub-Mode', scrubMode);
       res.setHeader(
         'Access-Control-Expose-Headers',
-        'X-Original-Size, X-Clean-Size, X-Process-Duration-Ms, X-Clean-Filename, X-Camera-Profile'
+        'X-Original-Size, X-Clean-Size, X-Process-Duration-Ms, X-Clean-Filename, X-Camera-Profile, X-Scrub-Mode'
       );
 
       res.status(200).send(cleanBuffer);
@@ -314,7 +355,7 @@ async function startServer() {
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Abubakar AI File Remover running on http://0.0.0.0:${PORT}`);
+    console.log(`AB.AIBypass.com (by abubakar) running on http://0.0.0.0:${PORT}`);
   });
 }
 
