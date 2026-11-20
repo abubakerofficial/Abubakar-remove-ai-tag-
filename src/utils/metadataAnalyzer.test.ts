@@ -5,6 +5,8 @@ import {
   validateMediaFile,
   formatBytes,
   inspectBinaryForAiMetadata,
+  inspectMediaBlobForAiMetadata,
+  scrubVideoBlobFast,
   buildFfmpegCommandString,
   FFMPEG_LOSSLESS_ARGS,
   stripMp4MetadataInBrowser,
@@ -399,4 +401,149 @@ test('buildFfmpegCameraMetadataArgs outputs QuickTime mov flag for DSLR/Mobile a
   const cleanArgs = buildFfmpegCameraMetadataArgs(getCameraProfile('none'), 'mp4');
   assert.ok(cleanArgs.includes('+bitexact'));
 });
+
+test('scrubVideoBlobFast scrubs moov-before-mdat MP4 via zero-copy Blob slices with exact stco shift', async () => {
+  const makeBox = (type: string, payload: Uint8Array): Uint8Array => {
+    const size = 8 + payload.byteLength;
+    const out = new Uint8Array(size);
+    new DataView(out.buffer).setUint32(0, size, false);
+    for (let i = 0; i < 4; i++) out[4 + i] = type.charCodeAt(i);
+    out.set(payload, 8);
+    return out;
+  };
+  const concat = (arrs: Uint8Array[]) => {
+    const out = new Uint8Array(arrs.reduce((a, b) => a + b.byteLength, 0));
+    let p = 0;
+    for (const a of arrs) {
+      out.set(a, p);
+      p += a.byteLength;
+    }
+    return out;
+  };
+
+  const enc = new TextEncoder();
+  const ftyp = makeBox('ftyp', enc.encode('isom0000isommp42'));
+  const hdlrPayload = new Uint8Array(25);
+  hdlrPayload.set(enc.encode('vide'), 8);
+  const hdlr = makeBox('hdlr', hdlrPayload);
+  const stcoPayload = new Uint8Array(12);
+  new DataView(stcoPayload.buffer).setUint32(4, 1, false);
+  const stco = makeBox('stco', stcoPayload);
+  const mdia = makeBox('mdia', concat([hdlr, makeBox('minf', makeBox('stbl', stco))]));
+  const trak = makeBox('trak', mdia);
+  const udta = makeBox('udta', enc.encode('Google Flow Veo Runway Gen-3 c2pa.jumbf'));
+  const moov = makeBox('moov', concat([trak, udta]));
+  const mdatPayload = enc.encode('ZERO_COPY_FRAME_DATA_9876543210');
+  const mdat = makeBox('mdat', mdatPayload);
+
+  const initialMdatOffset = ftyp.byteLength + moov.byteLength;
+  const fullMp4 = concat([ftyp, moov, mdat]);
+  const stcoIdx = new TextDecoder('latin1').decode(fullMp4).indexOf('stco');
+  new DataView(fullMp4.buffer).setUint32(stcoIdx + 12, initialMdatOffset + 8, false);
+
+  const inputBlob = new Blob([fullMp4 as unknown as BlobPart], { type: 'video/mp4' });
+  const result = await scrubVideoBlobFast(inputBlob, getCameraProfile('iphone_16_pro'), 'mov');
+
+  assert.equal(result.processedAsIso, true);
+  assert.equal(result.blob.size, result.cleanSize);
+
+  const outBytes = new Uint8Array(await result.blob.arrayBuffer());
+  const outText = new TextDecoder('latin1').decode(outBytes);
+
+  assert.equal(outText.slice(4, 12), 'ftypqt  ');
+  assert.equal(/Google Flow|Runway|c2pa/i.test(outText), false);
+  assert.ok(outText.includes('com.apple.quicktime.make'));
+  assert.ok(outText.includes('iPhone 16 Pro Max'));
+  assert.ok(outText.includes('com.apple.quicktime.camera.lens_model'));
+  assert.ok(outText.includes('ZERO_COPY_FRAME_DATA_9876543210'));
+
+  const newMdatBoxIdx = outText.indexOf('mdat') - 4;
+  const newStcoIdx = outText.indexOf('stco');
+  const patchedOffset = new DataView(outBytes.buffer).getUint32(newStcoIdx + 12, false);
+  assert.equal(patchedOffset, newMdatBoxIdx + 8);
+});
+
+test('scrubVideoBlobFast handles moov-after-mdat phone videos, promotes moov to faststart, and shifts stco accurately', async () => {
+  const makeBox = (type: string, payload: Uint8Array): Uint8Array => {
+    const size = 8 + payload.byteLength;
+    const out = new Uint8Array(size);
+    new DataView(out.buffer).setUint32(0, size, false);
+    for (let i = 0; i < 4; i++) out[4 + i] = type.charCodeAt(i);
+    out.set(payload, 8);
+    return out;
+  };
+  const concat = (arrs: Uint8Array[]) => {
+    const out = new Uint8Array(arrs.reduce((a, b) => a + b.byteLength, 0));
+    let p = 0;
+    for (const a of arrs) {
+      out.set(a, p);
+      p += a.byteLength;
+    }
+    return out;
+  };
+
+  const enc = new TextEncoder();
+  const ftyp = makeBox('ftyp', enc.encode('mp420000isommp42'));
+  const mdatPayload = enc.encode('PHONE_VIDEO_FRAMES_PRESERVED_EXACTLY');
+  const mdat = makeBox('mdat', mdatPayload);
+
+  const hdlrPayload = new Uint8Array(25);
+  hdlrPayload.set(enc.encode('vide'), 8);
+  const hdlr = makeBox('hdlr', hdlrPayload);
+  const stcoPayload = new Uint8Array(12);
+  new DataView(stcoPayload.buffer).setUint32(4, 1, false);
+  // Original stco points to ftyp.byteLength + 8 (mdat payload)
+  new DataView(stcoPayload.buffer).setUint32(8, ftyp.byteLength + 8, false);
+  const stco = makeBox('stco', stcoPayload);
+  const mdia = makeBox('mdia', concat([hdlr, makeBox('minf', makeBox('stbl', stco))]));
+  const trak = makeBox('trak', mdia);
+  const udta = makeBox('udta', enc.encode('Luma Dream Machine PikaLabs AI_GENERATED'));
+  const moov = makeBox('moov', concat([trak, udta]));
+
+  // Phone layout: [ftyp, mdat, moov]
+  const phoneMp4 = concat([ftyp, mdat, moov]);
+  const inputBlob = new Blob([phoneMp4 as unknown as BlobPart], { type: 'video/mp4' });
+
+  const result = await scrubVideoBlobFast(inputBlob, getCameraProfile('sony_a7iv'), 'mov');
+  assert.equal(result.processedAsIso, true);
+
+  const outBytes = new Uint8Array(await result.blob.arrayBuffer());
+  const outText = new TextDecoder('latin1').decode(outBytes);
+
+  // Faststart: moov must appear BEFORE mdat
+  const moovIdx = outText.indexOf('moov');
+  const mdatIdx = outText.indexOf('mdat');
+  assert.ok(moovIdx > 0 && moovIdx < mdatIdx);
+  assert.equal(/Luma|PikaLabs|AI_GENERATED/i.test(outText), false);
+  assert.ok(outText.includes('SONY'));
+  assert.ok(outText.includes('ILCE-7M4'));
+  assert.ok(outText.includes('PHONE_VIDEO_FRAMES_PRESERVED_EXACTLY'));
+
+  const newMdatBoxStart = mdatIdx - 4;
+  const newStcoIdx = outText.indexOf('stco');
+  const patchedOffset = new DataView(outBytes.buffer).getUint32(newStcoIdx + 12, false);
+  assert.equal(patchedOffset, newMdatBoxStart + 8);
+});
+
+test('inspectMediaBlobForAiMetadata reads head and tail slices of large Blobs without loading full buffer', async () => {
+  const enc = new TextEncoder();
+  const head = enc.encode('ftypisom...Runway Gen-3');
+  const middle = new Uint8Array(600_000); // > 512 KB filler
+  const tail = enc.encode('moov...udta...Google Flow SynthID c2pa.jumbf');
+  const largeBlob = new Blob(
+    [
+      head as unknown as BlobPart,
+      middle as unknown as BlobPart,
+      tail as unknown as BlobPart,
+    ],
+    { type: 'video/mp4' }
+  );
+
+  const tags = await inspectMediaBlobForAiMetadata(largeBlob, 'large_clip.mp4', 'video');
+  const platforms = tags.map((t) => t.platform);
+  assert.ok(platforms.includes('Runway'));
+  assert.ok(platforms.includes('Google Flow'));
+  assert.ok(platforms.includes('C2PA / EXIF'));
+});
+
 

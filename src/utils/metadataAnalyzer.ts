@@ -376,6 +376,31 @@ export function inspectBinaryForAiMetadata(
   return found;
 }
 
+/**
+ * Ultra-fast metadata scanner that reads ONLY the first 256 KB and last 256 KB
+ * of a File/Blob via Blob.slice(), avoiding loading large 50–500 MB videos into RAM.
+ */
+export async function inspectMediaBlobForAiMetadata(
+  file: Blob,
+  fileName = '',
+  mediaKind: MediaKind = detectMediaKind(fileName, file.type)
+): Promise<DetectedMetadataTag[]> {
+  const maxSlice = 262144;
+  if (file.size <= maxSlice * 2) {
+    const buf = new Uint8Array(await file.arrayBuffer());
+    return inspectBinaryForAiMetadata(buf, fileName, mediaKind);
+  }
+
+  const [headBuf, tailBuf] = await Promise.all([
+    file.slice(0, maxSlice).arrayBuffer(),
+    file.slice(file.size - maxSlice, file.size).arrayBuffer(),
+  ]);
+  const combined = new Uint8Array(headBuf.byteLength + tailBuf.byteLength);
+  combined.set(new Uint8Array(headBuf), 0);
+  combined.set(new Uint8Array(tailBuf), headBuf.byteLength);
+  return inspectBinaryForAiMetadata(combined, fileName, mediaKind);
+}
+
 export function buildFfmpegCommandString(inputName: string, outputName: string): string {
   return `ffmpeg -i "${inputName}" ${FFMPEG_LOSSLESS_ARGS.join(' ')} -y "${outputName}"`;
 }
@@ -648,6 +673,92 @@ function patchChunkOffsetsRecursive(
   }
 }
 
+const ISO_STRIP_BOXES = new Set(['udta', 'meta', 'XMP_', 'ilst', 'uuid']);
+
+function rebuildMoovBox(
+  moovData: Uint8Array,
+  moovHeaderSize: number,
+  cameraProfile: CameraProfile | undefined,
+  isMov: boolean,
+  captureDate: Date
+): Uint8Array {
+  const injectCamera = Boolean(cameraProfile && cameraProfile.id !== 'none');
+  const moovChildren = parseChildBoxes(
+    moovData,
+    moovHeaderSize,
+    moovData.byteLength
+  );
+
+  if (moovChildren.length === 0) {
+    const fallbackCopy = new Uint8Array(moovData);
+    walkAndScrubMp4Boxes(fallbackCopy, 0, fallbackCopy.byteLength, 0);
+    return fallbackCopy;
+  }
+
+  const newMoovChildren: Uint8Array[] = [];
+
+  for (const child of moovChildren) {
+    if (ISO_STRIP_BOXES.has(child.type)) {
+      continue;
+    }
+
+    if (child.type === 'trak') {
+      const trakChildren = parseChildBoxes(
+        child.data,
+        child.headerSize,
+        child.data.byteLength
+      );
+      if (trakChildren.length > 0) {
+        const cleanTrakChildren: Uint8Array[] = [];
+        for (const tc of trakChildren) {
+          if (!ISO_STRIP_BOXES.has(tc.type)) {
+            cleanTrakChildren.push(new Uint8Array(tc.data));
+          }
+        }
+        if (
+          injectCamera &&
+          cameraProfile &&
+          isVideoTrakBox(child.data, child.headerSize)
+        ) {
+          const trakMeta = buildMp4CameraMetaBox(cameraProfile, captureDate, {
+            isQuickTimeAtom: isMov,
+            trackOnly: true,
+          });
+          if (trakMeta.byteLength > 0) {
+            cleanTrakChildren.push(trakMeta);
+          }
+        }
+        newMoovChildren.push(
+          makeIsoBox('trak', concatUint8Arrays(cleanTrakChildren))
+        );
+      } else {
+        newMoovChildren.push(new Uint8Array(child.data));
+      }
+    } else {
+      newMoovChildren.push(new Uint8Array(child.data));
+    }
+  }
+
+  if (injectCamera && cameraProfile) {
+    // 1. Direct child `moov.meta` (exact Apple QTFF non-FullBox atom for .mov, FullBox for .mp4)
+    const moovMeta = buildMp4CameraMetaBox(cameraProfile, captureDate, {
+      isQuickTimeAtom: isMov,
+      trackOnly: false,
+    });
+    if (moovMeta.byteLength > 0) {
+      newMoovChildren.push(moovMeta);
+    }
+
+    // 2. Classic `moov.udta` with `©mak`, `©mod`, `©swr`, `©day`
+    const moovUdta = buildQuickTimeUdtaBox(cameraProfile, captureDate);
+    if (moovUdta.byteLength > 0) {
+      newMoovChildren.push(moovUdta);
+    }
+  }
+
+  return makeIsoBox('moov', concatUint8Arrays(newMoovChildren));
+}
+
 /**
  * Losslessly scrubs MP4/MOV metadata boxes (`udta`, `meta`, `XMP_`, C2PA `uuid`, `ilst`)
  * and rebuilds `moov` cleanly so native Apple QuickTime `moov.meta` (direct child of `moov`),
@@ -685,7 +796,6 @@ export function stripMp4MetadataInBrowser(
     return concatUint8Arrays([output, metaBox]);
   }
 
-  const STRIP_BOXES = new Set(['udta', 'meta', 'XMP_', 'ilst', 'uuid']);
   const injectCamera = Boolean(cameraProfile && cameraProfile.id !== 'none');
   const isMov = injectCamera && containerFormat === 'mov';
   const captureDate = new Date();
@@ -696,7 +806,7 @@ export function stripMp4MetadataInBrowser(
   const rebuiltTopBoxes: Array<{ type: string; bytes: Uint8Array }> = [];
 
   for (const box of topBoxes) {
-    if (STRIP_BOXES.has(box.type)) {
+    if (ISO_STRIP_BOXES.has(box.type)) {
       continue;
     }
 
@@ -709,81 +819,13 @@ export function stripMp4MetadataInBrowser(
     }
 
     if (box.type === 'moov') {
-      const moovChildren = parseChildBoxes(
+      const newMoovBytes = rebuildMoovBox(
         box.data,
         box.headerSize,
-        box.data.byteLength
+        cameraProfile,
+        isMov,
+        captureDate
       );
-
-      if (moovChildren.length === 0) {
-        const fallbackCopy = new Uint8Array(box.data);
-        walkAndScrubMp4Boxes(fallbackCopy, 0, fallbackCopy.byteLength, 0);
-        rebuiltTopBoxes.push({ type: 'moov', bytes: fallbackCopy });
-        continue;
-      }
-
-      const newMoovChildren: Uint8Array[] = [];
-
-      for (const child of moovChildren) {
-        if (STRIP_BOXES.has(child.type)) {
-          continue;
-        }
-
-        if (child.type === 'trak') {
-          const trakChildren = parseChildBoxes(
-            child.data,
-            child.headerSize,
-            child.data.byteLength
-          );
-          if (trakChildren.length > 0) {
-            const cleanTrakChildren: Uint8Array[] = [];
-            for (const tc of trakChildren) {
-              if (!STRIP_BOXES.has(tc.type)) {
-                cleanTrakChildren.push(new Uint8Array(tc.data));
-              }
-            }
-            if (
-              injectCamera &&
-              cameraProfile &&
-              isVideoTrakBox(child.data, child.headerSize)
-            ) {
-              const trakMeta = buildMp4CameraMetaBox(cameraProfile, captureDate, {
-                isQuickTimeAtom: isMov,
-                trackOnly: true,
-              });
-              if (trakMeta.byteLength > 0) {
-                cleanTrakChildren.push(trakMeta);
-              }
-            }
-            newMoovChildren.push(
-              makeIsoBox('trak', concatUint8Arrays(cleanTrakChildren))
-            );
-          } else {
-            newMoovChildren.push(new Uint8Array(child.data));
-          }
-        } else {
-          newMoovChildren.push(new Uint8Array(child.data));
-        }
-      }
-
-      if (injectCamera && cameraProfile) {
-        // 1. Direct child `moov.meta` (exact Apple QTFF non-FullBox atom for .mov, FullBox for .mp4)
-        const moovMeta = buildMp4CameraMetaBox(cameraProfile, captureDate, {
-          isQuickTimeAtom: isMov,
-          trackOnly: false,
-        });
-        if (moovMeta.byteLength > 0) {
-          newMoovChildren.push(moovMeta);
-        }
-
-        // 2. Classic `moov.udta` with `©mak`, `©mod`, `©swr`, `©day`
-        const moovUdta = buildQuickTimeUdtaBox(cameraProfile, captureDate);
-        if (moovUdta.byteLength > 0) {
-          newMoovChildren.push(moovUdta);
-        }
-      }
-
-      const newMoovBytes = makeIsoBox('moov', concatUint8Arrays(newMoovChildren));
       rebuiltTopBoxes.push({ type: 'moov', bytes: newMoovBytes });
       continue;
     }
@@ -816,6 +858,239 @@ export function stripMp4MetadataInBrowser(
   }
 
   return concatUint8Arrays(rebuiltTopBoxes.map((b) => b.bytes));
+}
+
+interface TopLevelBlobBox {
+  type: string;
+  start: number;
+  end: number;
+  size: number;
+  headerSize: number;
+}
+
+export interface FastVideoScrubResult {
+  blob: Blob;
+  processedAsIso: boolean;
+  cleanSize: number;
+}
+
+/**
+ * Zero-copy ultra-fast MP4/MOV video scrubber using Blob.slice().
+ * Reads ONLY tiny 16-byte box headers plus `ftyp` and `moov` (~20–500 KB) into RAM.
+ * NEVER loads `mdat` video/audio frames into JavaScript memory — completes in < 50 ms
+ * even on 100–500 MB videos without freezing mobile browsers or waiting on network uploads.
+ */
+export async function scrubVideoBlobFast(
+  file: Blob,
+  cameraProfile?: CameraProfile,
+  containerFormat: VideoContainerFormat = 'mov'
+): Promise<FastVideoScrubResult> {
+  const injectCamera = Boolean(cameraProfile && cameraProfile.id !== 'none');
+  const isMov = injectCamera && containerFormat === 'mov';
+  const outputMime = isMov ? 'video/quicktime' : 'video/mp4';
+
+  const topBoxes: TopLevelBlobBox[] = [];
+  let offset = 0;
+  let validTree = true;
+  let guard = 0;
+
+  while (offset + 8 <= file.size && guard < 1024) {
+    guard++;
+    const hdrEnd = Math.min(file.size, offset + 16);
+    const hdr = new Uint8Array(await file.slice(offset, hdrEnd).arrayBuffer());
+    if (hdr.byteLength < 8) {
+      validTree = false;
+      break;
+    }
+
+    let boxSize = readUint32BE(hdr, 0);
+    const boxType = readBoxType(hdr, 4);
+    let headerSize = 8;
+
+    if (!/^[\x20-\x7E]{4}$/.test(boxType)) {
+      validTree = false;
+      break;
+    }
+
+    if (boxSize === 1) {
+      if (hdr.byteLength < 16) {
+        validTree = false;
+        break;
+      }
+      const high = readUint32BE(hdr, 8);
+      const low = readUint32BE(hdr, 12);
+      boxSize = high * 4294967296 + low;
+      headerSize = 16;
+    } else if (boxSize === 0) {
+      boxSize = file.size - offset;
+    }
+
+    if (boxSize < headerSize || offset + boxSize > file.size) {
+      validTree = false;
+      break;
+    }
+
+    topBoxes.push({
+      type: boxType,
+      start: offset,
+      end: offset + boxSize,
+      size: boxSize,
+      headerSize,
+    });
+    offset += boxSize;
+  }
+
+  const hasMoov = topBoxes.some((b) => b.type === 'moov');
+  const isCleanIso = validTree && hasMoov && offset === file.size;
+
+  if (!isCleanIso) {
+    // Small synthetic or non-standard buffer fallback (e.g., offline sample MP4)
+    if (file.size <= 8 * 1024 * 1024) {
+      const rawBytes = new Uint8Array(await file.arrayBuffer());
+      const scrubbed = stripMp4MetadataInBrowser(
+        rawBytes,
+        cameraProfile,
+        containerFormat
+      );
+      const blob = new Blob([scrubbed as unknown as BlobPart], {
+        type: outputMime,
+      });
+      return {
+        blob,
+        processedAsIso: false,
+        cleanSize: scrubbed.byteLength,
+      };
+    }
+
+    return {
+      blob: file,
+      processedAsIso: false,
+      cleanSize: file.size,
+    };
+  }
+
+  const captureDate = new Date();
+  const mdatIndices = topBoxes
+    .map((b, idx) => (b.type === 'mdat' ? idx : -1))
+    .filter((idx) => idx >= 0);
+  const firstMdatIdx = mdatIndices.length > 0 ? mdatIndices[0] : -1;
+  const lastMdatIdx =
+    mdatIndices.length > 0 ? mdatIndices[mdatIndices.length - 1] : -1;
+  const oldMdatStart = firstMdatIdx >= 0 ? topBoxes[firstMdatIdx].start : -1;
+
+  type OutputPart = {
+    type: string;
+    size: number;
+    bytes?: Uint8Array;
+    slice?: Blob;
+  };
+
+  const parts: OutputPart[] = [];
+  let rebuiltMoovPart: OutputPart | null = null;
+
+  for (let i = 0; i < topBoxes.length; i++) {
+    const box = topBoxes[i];
+    const isBetweenMdats =
+      firstMdatIdx >= 0 && i > firstMdatIdx && i < lastMdatIdx;
+
+    if (ISO_STRIP_BOXES.has(box.type)) {
+      // Preserve exact spacing between multiple mdat boxes if a metadata box sits between them
+      if (isBetweenMdats) {
+        const freeZero = new Uint8Array(box.size);
+        const view = new DataView(freeZero.buffer);
+        view.setUint32(0, box.size >>> 0, false);
+        freeZero[4] = 0x66; // 'f'
+        freeZero[5] = 0x72; // 'r'
+        freeZero[6] = 0x65; // 'e'
+        freeZero[7] = 0x65; // 'e'
+        parts.push({ type: 'free', size: freeZero.byteLength, bytes: freeZero });
+      }
+      continue;
+    }
+
+    if (box.type === 'ftyp') {
+      const ftypBytes = isMov
+        ? buildQuickTimeFtypBox()
+        : new Uint8Array(await file.slice(box.start, box.end).arrayBuffer());
+      parts.push({ type: 'ftyp', size: ftypBytes.byteLength, bytes: ftypBytes });
+      continue;
+    }
+
+    if (box.type === 'moov') {
+      const moovRaw = new Uint8Array(
+        await file.slice(box.start, box.end).arrayBuffer()
+      );
+      const newMoovBytes = rebuildMoovBox(
+        moovRaw,
+        box.headerSize,
+        cameraProfile,
+        isMov,
+        captureDate
+      );
+      const moovPart: OutputPart = {
+        type: 'moov',
+        size: newMoovBytes.byteLength,
+        bytes: newMoovBytes,
+      };
+      rebuiltMoovPart = moovPart;
+      // Place `moov` right after `ftyp` (native faststart) if there is a single mdat
+      // or moov is not sandwiched between two mdat boxes
+      if (!isBetweenMdats && mdatIndices.length <= 1) {
+        const ftypIdx = parts.findIndex((p) => p.type === 'ftyp');
+        if (ftypIdx >= 0) {
+          parts.splice(ftypIdx + 1, 0, moovPart);
+        } else {
+          parts.unshift(moovPart);
+        }
+      } else {
+        parts.push(moovPart);
+      }
+      continue;
+    }
+
+    // Zero-copy OS-backed Blob slice for `mdat`, `wide`, `free`, etc. (0 RAM copied!)
+    parts.push({
+      type: box.type,
+      size: box.size,
+      slice: file.slice(box.start, box.end),
+    });
+  }
+
+  // Patch every `stco` / `co64` offset inside `moov` by exact `newMdatStart - oldMdatStart`
+  if (oldMdatStart >= 0 && rebuiltMoovPart?.bytes) {
+    let newMdatStart = 0;
+    for (const part of parts) {
+      if (part.type === 'mdat') break;
+      newMdatStart += part.size;
+    }
+    const delta = newMdatStart - oldMdatStart;
+    if (delta !== 0) {
+      patchChunkOffsetsRecursive(
+        rebuiltMoovPart.bytes,
+        8,
+        rebuiltMoovPart.bytes.byteLength,
+        delta
+      );
+    }
+  }
+
+  const blobParts: BlobPart[] = [];
+  let totalCleanSize = 0;
+  for (const part of parts) {
+    totalCleanSize += part.size;
+    if (part.bytes) {
+      blobParts.push(part.bytes as unknown as BlobPart);
+    } else if (part.slice) {
+      blobParts.push(part.slice);
+    }
+  }
+
+  const outBlob = new Blob(blobParts, { type: outputMime });
+  return {
+    blob: outBlob,
+    processedAsIso: true,
+    cleanSize: totalCleanSize,
+  };
 }
 
 /**

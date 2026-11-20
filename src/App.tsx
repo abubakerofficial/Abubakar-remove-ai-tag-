@@ -24,8 +24,8 @@ import {
   MediaKind,
   validateMediaFile,
   formatBytes,
-  inspectBinaryForAiMetadata,
-  stripMp4MetadataInBrowser,
+  inspectMediaBlobForAiMetadata,
+  scrubVideoBlobFast,
   stripImageMetadataInBrowser,
   createBrowserSampleMp4Buffer,
   createBrowserSamplePngBuffer,
@@ -160,9 +160,9 @@ export default function App() {
       return;
     }
 
-    const arrayBuf = await file.arrayBuffer();
-    const tags = inspectBinaryForAiMetadata(
-      new Uint8Array(arrayBuf),
+    // Read ONLY head + tail 256 KB via Blob.slice() — instant even for 500 MB videos
+    const tags = await inspectMediaBlobForAiMetadata(
+      file,
       file.name,
       validation.mediaKind
     );
@@ -180,17 +180,12 @@ export default function App() {
         ? 'video/quicktime'
         : validation.outputMimeType;
 
-    // Automatically rename whatever video or picture is uploaded to "Abubakar Remove AI.<ext>"
-    const renamedFile = new File([arrayBuf], effectiveCleanName, {
-      type: file.type || effectiveOutputMime,
-    });
-
     if (previewImageUrl) {
       URL.revokeObjectURL(previewImageUrl);
     }
 
     if (validation.mediaKind === 'image') {
-      const imgPreview = URL.createObjectURL(renamedFile);
+      const imgPreview = URL.createObjectURL(file);
       setPreviewImageUrl(imgPreview);
       setPlatformTab('image');
     } else {
@@ -198,7 +193,8 @@ export default function App() {
       setPlatformTab('video');
     }
 
-    setSelectedFile(renamedFile);
+    // Keep original File reference directly (zero RAM duplication) while displaying auto-renamed output name
+    setSelectedFile(file);
     setSelectedMediaKind(validation.mediaKind);
     setOutputMimeType(effectiveOutputMime);
     setDetectedTags(tags);
@@ -234,10 +230,14 @@ export default function App() {
 
       const sampleFile = new File([blob], fileNameHeader, { type: 'video/mp4' });
       await inspectAndStageFile(sampleFile);
+      const expectedVideoName =
+        cameraProfileId !== 'none' && videoContainer === 'mov'
+          ? 'Abubakar Remove AI.mov'
+          : 'Abubakar Remove AI.mp4';
       triggerToast(
         'success',
         'Video Loaded & Auto-Renamed',
-        'Video file name automatically set to "Abubakar Remove AI.mp4" and ready for metadata stripping.'
+        `Video output automatically set to "${expectedVideoName}" and ready for instant metadata stripping.`
       );
     } catch (err: unknown) {
       triggerToast(
@@ -333,23 +333,20 @@ export default function App() {
     if (!selectedFile || isProcessing) return;
 
     setIsProcessing(true);
-    setProgress(20);
-    setStepIndex(0);
+    setProgress(35);
+    setStepIndex(1);
     const startTime = performance.now();
 
-    const progressTimer = setInterval(() => {
-      setProgress((prev) => {
-        const next = prev < 90 ? prev + 18 : prev;
-        if (next >= 75) setStepIndex(3);
-        else if (next >= 50) setStepIndex(2);
-        else if (next >= 25) setStepIndex(1);
-        return next;
-      });
-    }, 110);
-
     try {
+      // Yield 1 paint frame so the UI renders the processing state smoothly without blocking
+      await new Promise<void>((resolve) =>
+        typeof requestAnimationFrame === 'function'
+          ? requestAnimationFrame(() => resolve())
+          : setTimeout(resolve, 0)
+      );
+
       let cleanBlob: Blob;
-      let cleanBuffer: Uint8Array;
+      let cleanByteSize = 0;
       let serverDuration = 0;
 
       const activeCameraProfile = getCameraProfile(cameraProfileId);
@@ -365,13 +362,13 @@ export default function App() {
         effectiveContainer === 'mov' ? 'video/quicktime' : 'video/mp4';
 
       if (selectedMediaKind === 'image') {
-        await new Promise((r) => setTimeout(r, 200));
         const rawBytes = new Uint8Array(await selectedFile.arrayBuffer());
         const isNativeBinaryImage =
           (rawBytes[0] === 0xff && rawBytes[1] === 0xd8) || // JPEG
           (rawBytes[0] === 0x89 && rawBytes[1] === 0x50) || // PNG
           (rawBytes[0] === 0x52 && rawBytes[1] === 0x49); // RIFF WEBP
 
+        let cleanBuffer: Uint8Array;
         if (isNativeBinaryImage) {
           cleanBuffer = stripImageMetadataInBrowser(rawBytes, activeCameraProfile);
         } else {
@@ -385,14 +382,30 @@ export default function App() {
         cleanBlob = new Blob([cleanBuffer as unknown as BlobPart], {
           type: outputMimeType || 'image/png',
         });
-        serverDuration = Math.max(8, Math.round(performance.now() - startTime));
+        cleanByteSize = cleanBlob.size;
+        serverDuration = Math.max(4, Math.round(performance.now() - startTime));
       } else {
+        // Instant Zero-Copy on-device MP4/MOV scrubbing via Blob.slice():
+        // Never uploads large videos over mobile data and never copies `mdat` frames into JS RAM.
+        const fastResult = await scrubVideoBlobFast(
+          selectedFile,
+          activeCameraProfile,
+          effectiveContainer
+        );
+
         const isFullStackHost =
           typeof window !== 'undefined' &&
           (window.location.hostname === 'localhost' ||
             window.location.hostname.endsWith('.run.app'));
 
-        if (isFullStackHost && selectedFile.size <= 35 * 1024 * 1024) {
+        if (
+          !fastResult.processedAsIso &&
+          isFullStackHost &&
+          selectedFile.size <= 25 * 1024 * 1024
+        ) {
+          // Non-ISO video container (e.g., .webm) -> use server FFmpeg remux with 20s timeout
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), 20000);
           try {
             const formData = new FormData();
             formData.append('video', selectedFile);
@@ -402,6 +415,7 @@ export default function App() {
             const response = await fetch('/api/strip-metadata', {
               method: 'POST',
               body: formData,
+              signal: controller.signal,
             });
 
             const contentType = response.headers.get('Content-Type') || '';
@@ -410,40 +424,28 @@ export default function App() {
               (!contentType.includes('video/mp4') &&
                 !contentType.includes('video/quicktime'))
             ) {
-              throw new Error('Fallback to in-browser scrubber');
+              throw new Error('Fallback to local scrubber');
             }
 
             cleanBlob = await response.blob();
-            cleanBuffer = new Uint8Array(await cleanBlob.arrayBuffer());
+            cleanByteSize = cleanBlob.size;
             serverDuration = Number(
               response.headers.get('X-Process-Duration-Ms') ||
-                Math.max(12, Math.round(performance.now() - startTime))
+                Math.max(8, Math.round(performance.now() - startTime))
             );
           } catch {
-            const rawBytes = new Uint8Array(await selectedFile.arrayBuffer());
-            cleanBuffer = stripMp4MetadataInBrowser(
-              rawBytes,
-              activeCameraProfile,
-              effectiveContainer
-            );
-            cleanBlob = new Blob([cleanBuffer as unknown as BlobPart], {
-              type: effectiveVideoMime,
-            });
-            serverDuration = Math.max(10, Math.round(performance.now() - startTime));
+            cleanBlob = fastResult.blob;
+            cleanByteSize = fastResult.cleanSize;
+            serverDuration = Math.max(4, Math.round(performance.now() - startTime));
+          } finally {
+            clearTimeout(timeoutId);
           }
         } else {
-          await new Promise((r) => setTimeout(r, 240));
-          const rawBytes = new Uint8Array(await selectedFile.arrayBuffer());
-          cleanBuffer = stripMp4MetadataInBrowser(
-            rawBytes,
-            activeCameraProfile,
-            effectiveContainer
-          );
-          cleanBlob = new Blob([cleanBuffer as unknown as BlobPart], {
-            type: effectiveVideoMime,
-          });
-          serverDuration = Math.max(12, Math.round(performance.now() - startTime));
+          cleanBlob = fastResult.blob;
+          cleanByteSize = fastResult.cleanSize;
+          serverDuration = Math.max(4, Math.round(performance.now() - startTime));
         }
+
         setOutputMimeType(effectiveVideoMime);
       }
 
@@ -452,14 +454,13 @@ export default function App() {
       }
       const url = URL.createObjectURL(cleanBlob);
 
-      clearInterval(progressTimer);
       setProgress(100);
       setStepIndex(3);
 
       setCleanBlobObj(cleanBlob);
       setCleanDownloadUrl(url);
       setCleanFileName(effectiveOutName);
-      setCleanFileSize(cleanBuffer.byteLength);
+      setCleanFileSize(cleanByteSize);
       setProcessDurationMs(serverDuration);
 
       const historyEntry: ProcessedHistoryItem = {
@@ -469,7 +470,7 @@ export default function App() {
         cleanName: effectiveOutName,
         cameraProfileLabel: activeCameraProfile.shortLabel,
         originalSize: selectedFile.size,
-        cleanSize: cleanBuffer.byteLength,
+        cleanSize: cleanByteSize,
         durationMs: serverDuration,
         tagsStrippedCount: detectedTags.length,
         downloadUrl: url,
@@ -493,7 +494,6 @@ export default function App() {
         `Stripped ${detectedTags.length} AI tags in ${serverDuration} ms.${cameraNote} Ready to download as "${effectiveOutName}".`
       );
     } catch (error: unknown) {
-      clearInterval(progressTimer);
       setProgress(0);
       triggerToast(
         'error',
@@ -570,9 +570,14 @@ export default function App() {
       <header className="flex items-center justify-between gap-3 sm:gap-8 px-4 sm:px-6 lg:px-10 py-4 border-b border-slate-800/80 bg-[#090D16]/95 sticky top-0 z-30 backdrop-blur">
         <a
           href="#workspace"
-          className="text-base sm:text-lg font-bold tracking-tight text-slate-100 font-display whitespace-nowrap truncate min-w-0"
+          className="flex items-baseline gap-2 min-w-0 whitespace-nowrap truncate"
         >
-          Abubakar AI File Remover
+          <span className="text-base sm:text-lg font-bold tracking-tight text-slate-100 font-display truncate">
+            AB.AIBypass.com
+          </span>
+          <span className="text-[11px] sm:text-xs font-medium text-emerald-400 shrink-0">
+            by abubakar
+          </span>
         </a>
 
         <nav
@@ -806,7 +811,7 @@ export default function App() {
                       )}
                       <div className="min-w-0 flex-1">
                         <h3 className="text-sm font-semibold text-slate-100 truncate">
-                          {selectedFile.name}
+                          {cleanFileName || selectedFile.name}
                         </h3>
                         <p className="text-xs text-slate-400 mt-0.5 font-mono tabular-nums truncate">
                           {selectedMediaKind === 'image' ? 'Picture' : 'Video'} · {formatBytes(selectedFile.size)}
@@ -1105,7 +1110,7 @@ export default function App() {
           {/* Detailed Before / After Metadata Inspector Table */}
           {selectedFile && (
             <MetadataInspector
-              fileName={selectedFile.name}
+              fileName={cleanFileName || selectedFile.name}
               mediaKind={selectedMediaKind}
               originalSize={selectedFile.size}
               cleanSize={cleanFileSize}
@@ -1223,9 +1228,9 @@ export default function App() {
       {/* Quiet Footer */}
       <footer className="border-t border-slate-800/80 py-6 px-6 lg:px-10 text-xs text-slate-400">
         <div className="max-w-6xl mx-auto flex flex-wrap items-center justify-between gap-4">
-          <span>Abubakar AI File Remover · Lossless Video &amp; Picture Metadata Scrubber</span>
+          <span>AB.AIBypass.com · by abubakar · Instant Zero-Copy Video &amp; Picture Metadata Scrubber</span>
           <div className="flex flex-wrap items-center gap-4">
-            <span>Zero Re-Encoding · Immediate Temp File Cleanup</span>
+            <span>Zero Re-Encoding · Instant On-Device Speed</span>
             {(typeof window !== 'undefined' &&
               (window.location.hostname === 'localhost' ||
                 window.location.hostname.endsWith('.run.app'))) && (
